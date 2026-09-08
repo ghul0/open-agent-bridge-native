@@ -29,7 +29,6 @@
     "lint:fix": "biome check src/ --write"
   },
   "dependencies": {
-    "@anthropic-ai/claude-code": "^2.1.79",
     "@anthropic-ai/sdk": "^0.91.1",
     "@clack/prompts": "^1.5.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
