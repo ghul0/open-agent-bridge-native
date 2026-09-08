@@ -93,9 +93,10 @@ program.command("backup").requiredOption("--to <path>").action(async (options) =
   const store = new ChannelStore(join(stateDirectory, "ledger.sqlite"));
   try { console.log(JSON.stringify(store.backup(options.to), null, 2)); } finally { store.close(); }
 });
-program.command("e2e").option("--suite <name>", "Acceptance suite", "local-3").option("--tmux").action(async (options) => {
+program.command("e2e").option("--suite <name>", "Acceptance suite", "local-3").option("--tmux").option("--run-id <id>").option("--resume", "Resume this runner's existing test sessions").option("--keep-sessions", "Leave test sessions for bounded follow-up checks").option("--approve-nab-tools", "Operator consent for session-only NAB list/send in test Codex sessions").action(async (options) => {
   if (options.suite !== "local-3" || !options.tmux) throw new Error("Use e2e --suite local-3 --tmux");
-  const result = await runE2E({ suite: "local-3", tmux: true, brokerUrl, launcher: fileURLToPath(import.meta.url) });
+  if (options.resume && !options.runId) throw new Error("--resume requires --run-id");
+  const result = await runE2E({ suite: "local-3", tmux: true, brokerUrl, launcher: fileURLToPath(import.meta.url), runId: options.runId, resume: options.resume, keepSessions: options.keepSessions, approveNabTools: options.approveNabTools });
   console.log(JSON.stringify(result, null, 2)); process.exitCode = result.status === "PASS" ? 0 : result.status === "FAIL" ? 1 : 2;
 });
 program.command("capture").argument("<action>").action((action) => {

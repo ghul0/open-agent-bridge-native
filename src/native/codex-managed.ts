@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { nativeAgentId, type NativeEndpoint } from "./contracts.js";
 import { HostLink, peerText } from "./host-link.js";
+import { ManagedProcesses } from "./managed-processes.js";
 import { CodexRuntime, type CodexRuntimeHealth } from "./codex-runtime.js";
 
 export interface ManagedCodexOptions {
@@ -28,52 +29,60 @@ export async function launchManagedCodex(options: ManagedCodexOptions): Promise<
   const appServerUrl = `ws://127.0.0.1:${port}`;
   const mcpCommand = fileURLToPath(new URL("./cli.js", import.meta.url));
   const mcpConfig = `mcp_servers.native_agent_broker={command=${toml(process.execPath)},args=[${toml(mcpCommand)},${toml("mcp")}],env={NAB_BROKER_URL=${toml(options.brokerUrl)},NAB_BINDING_FILE=${toml(bindingFile)}}}`;
-  const appServer = spawn(options.codexBinary, ["app-server", "--listen", appServerUrl, "-c", mcpConfig], { stdio: ["ignore", "inherit", "inherit"] });
+  const processes = new ManagedProcesses();
+  let hostLink: HostLink | undefined;
+  let runtime: CodexRuntime | undefined;
+  let closing = false;
+  const appServer = processes.add(spawn(options.codexBinary, ["app-server", "--listen", appServerUrl, "-c", mcpConfig], { cwd: project, stdio: ["ignore", "inherit", "inherit"] }));
   try {
     await waitForServer(appServerUrl, appServer);
     const threadId = await createManagedThread(appServerUrl, project);
     const agentId = nativeAgentId(options.hostId, "codex", threadId);
     await writeFile(bindingFile, `${JSON.stringify({ agentId, threadId, appServerUrl, name: options.name }, null, 2)}\n`, { mode: 0o600 });
 
-    const hostLink = new HostLink(options.brokerUrl, options.hostId, `codex:${options.name}`);
+    const link = new HostLink(options.brokerUrl, options.hostId, `codex:${options.name}`);
+    hostLink = link;
     const endpoint = (health: CodexRuntimeHealth): NativeEndpoint => ({
-      agentId, hostId: options.hostId, instanceId: hostLink.instanceId, harness: "codex", displayName: options.name,
+      agentId, hostId: options.hostId, instanceId: link.instanceId, harness: "codex", displayName: options.name,
       nativeSessionId: threadId, state: health.state === "busy" ? "active" : health.state === "idle" ? "idle" : health.state === "error" ? "error" : "disconnected",
       reachable: health.connected && health.initialized,
       capabilities: { receiveIdle: true, receiveBusy: "steer" },
     });
     const attachNonce = randomUUID();
-    const tui = spawn(options.codexBinary, ["--remote", appServerUrl, "-C", project, "-a", "on-request", "-c", mcpConfig, "resume", threadId, `Reply exactly NAB-TUI-ATTACHED-${attachNonce}. Do not use tools.`], { stdio: "inherit" });
+    const tui = processes.add(spawn(options.codexBinary, ["--remote", appServerUrl, "-C", project, "-a", "on-request", "-c", mcpConfig, "resume", threadId, `Reply exactly NAB-TUI-ATTACHED-${attachNonce}. Do not use tools.`], { cwd: project, stdio: "inherit" }));
     await waitForTuiAttach(appServerUrl, threadId, attachNonce, tui);
 
-    const runtime = new CodexRuntime({ appServerUrl, threadId });
-    await runtime.connect();
+    const sessionRuntime = new CodexRuntime({ appServerUrl, threadId });
+    runtime = sessionRuntime;
+    await sessionRuntime.connect();
     let reconnecting = false;
-    runtime.on("state", (health: CodexRuntimeHealth) => {
-      hostLink.update([endpoint(health)]);
-      if (health.state === "disconnected" && tui.exitCode === null && !reconnecting) {
+    sessionRuntime.on("state", (health: CodexRuntimeHealth) => {
+      link.update([endpoint(health)]);
+      if (health.state === "disconnected" && !closing && tui.exitCode === null && tui.signalCode === null && !reconnecting) {
         reconnecting = true;
-        reconnectRuntime(runtime, tui).finally(() => { reconnecting = false; });
+        reconnectRuntime(sessionRuntime, tui).finally(() => { reconnecting = false; });
       }
     });
     const deliveryTrace = join(sessionDir, "delivery-metadata.jsonl");
-    hostLink.onDeliver = async (message) => {
+    link.onDeliver = async (message) => {
       if (message.toAgentId !== agentId) return;
-      const result = await runtime.deliver(peerText(message), { policy: message.deliveryPolicy, messageId: message.messageId });
+      const result = await sessionRuntime.deliver(peerText(message), { policy: message.deliveryPolicy, messageId: message.messageId });
       await appendFile(deliveryTrace, `${JSON.stringify({ timestamp: new Date().toISOString(), messageId: message.messageId, policy: message.deliveryPolicy, state: result.state, method: result.method, turnId: result.turnId, expectedTurnId: result.expectedTurnId })}\n`, { mode: 0o600 });
-      hostLink.receipt(message.messageId, result.state, result.detail);
+      link.receipt(message.messageId, result.state, result.detail);
     };
-    hostLink.update([endpoint(runtime.health())]); hostLink.start();
-    const exitCode = await new Promise<number | null>((resolveExit, reject) => { tui.once("exit", resolveExit); tui.once("error", reject); });
-    hostLink.stop(); runtime.disconnect();
+    link.update([endpoint(sessionRuntime.health())]); link.start();
+    const exitCode = tui.exitCode !== null || tui.signalCode !== null ? tui.exitCode : await new Promise<number | null>((resolveExit, reject) => { tui.once("exit", resolveExit); tui.once("error", reject); });
     return { agentId, threadId, bindingFile, exitCode };
   } finally {
-    appServer.kill("SIGTERM");
+    closing = true;
+    hostLink?.stop();
+    runtime?.disconnect();
+    processes.close();
   }
 }
 
 async function reconnectRuntime(runtime: CodexRuntime, tui: ChildProcess): Promise<void> {
-  for (let attempt = 0; attempt < 8 && tui.exitCode === null; attempt++) {
+  for (let attempt = 0; attempt < 8 && tui.exitCode === null && tui.signalCode === null; attempt++) {
     await delay(Math.min(250 * 2 ** attempt, 5_000));
     try { await runtime.connect(); return; } catch { /* retry only the existing bound thread */ }
   }
@@ -107,7 +116,7 @@ async function waitForTuiAttach(url: string, threadId: string, nonce: string, tu
     await rpc.request("initialize", { clientInfo: { name: "nab-codex-attach-check", version: "0.1.0" }, capabilities: {}, protocolVersion: "0.1.0" }); rpc.notify("initialized", {});
     const marker = `NAB-TUI-ATTACHED-${nonce}`;
     for (let attempt = 0; attempt < 600; attempt++) {
-      if (tui.exitCode !== null) throw new Error(`Codex TUI exited before attach proof (${tui.exitCode})`);
+      if (tui.exitCode !== null || tui.signalCode !== null) throw new Error(`Codex TUI exited before attach proof (${tui.exitCode})`);
       try {
         const result = await rpc.request("thread/read", { threadId, includeTurns: true }) as { thread?: { id?: string; turns?: Array<{ items?: Array<{ type?: string; text?: string }> }> } };
         const items = result.thread?.turns?.flatMap((turn) => turn.items ?? []) ?? [];

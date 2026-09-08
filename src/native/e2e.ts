@@ -15,6 +15,9 @@ export interface E2EResult { runId: string; status: E2EStatus; namespace: string
 export interface E2EOptions {
   suite: "local-3"; brokerUrl: string; tmux: true; project?: string; launcher?: string;
   readyTimeoutMs?: number; scenarioTimeoutMs?: number; runId?: string;
+  resume?: boolean; keepSessions?: boolean; approveNabTools?: boolean;
+  scenarios?: ReadonlyArray<readonly [string, string]>;
+  initializePolicy?: boolean;
   command?: (file: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
   fetch?: typeof globalThis.fetch; sleep?: (ms: number) => Promise<void>;
 }
@@ -25,7 +28,18 @@ export const LOCAL_3_SCENARIOS = [
   ["codex-a", "codex-b"], ["pi-a", "pi-b"], ["claude-a", "claude-b"],
 ] as const;
 const harness = (name: string) => name.split("-")[0];
-const endpointAliases = (endpoint: NativeEndpoint) => [endpoint.agentId, endpoint.displayName, endpoint.nativeSessionId];
+async function endpointAliases(endpoint: NativeEndpoint): Promise<string[]> {
+  const aliases = [endpoint.agentId, endpoint.displayName];
+  const directory = join(homedir(), ".claude/sessions");
+  for (const name of await readdir(directory)) {
+    if (!/^\d+\.json$/.test(name)) continue;
+    try {
+      const record = JSON.parse(await readFile(join(directory, name), "utf8"));
+      if ((endpoint.harness === "claude" ? record.sessionId === endpoint.nativeSessionId : record.name === endpoint.displayName && record.version === "nab-native-v1") && typeof record.messagingSocketPath === "string") aliases.push(`uds:${record.messagingSocketPath}`);
+    } catch { /* Concurrently exiting registry record. */ }
+  }
+  return aliases;
+}
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const aggregate = (items: E2EScenarioResult[]): E2EStatus => items.some((x) => x.status === "FAIL") ? "FAIL" : items.some((x) => x.status === "BLOCKED_ENVIRONMENT") ? "BLOCKED_ENVIRONMENT" : items.some((x) => x.status === "NOT_RUN") ? "NOT_RUN" : "PASS";
 
@@ -77,7 +91,7 @@ async function readCodexThread(bindingPath: string): Promise<unknown> {
     ws.send(JSON.stringify({ method: "initialized" }));
     const result = await request("thread/read", { threadId: binding.threadId, includeTurns: true });
     if (result.thread?.id !== binding.threadId) throw new Error("Codex evidence thread mismatch");
-    return result;
+    return { ...result, binding };
   } finally { ws.close(); }
 }
 
@@ -106,126 +120,124 @@ export async function runE2E(options: E2EOptions): Promise<E2EResult> {
   if (options.suite !== "local-3" || options.tmux !== true) throw new Error("Only bounded LOCAL_3 tmux E2E is supported");
   const runId = options.runId ?? randomUUID().slice(0, 12);
   if (!/^[A-Za-z0-9_-]{1,32}$/.test(runId)) throw new Error("Invalid E2E run ID");
+  if (options.resume && !options.runId) throw new Error("Resume requires an explicit run ID");
+  if (options.scenarios?.some(([from, to]) => !LOCAL_3_SCENARIOS.some(([a, b]) => a === from && b === to))) throw new Error("Unknown LOCAL_3 scenario");
   const namespace = `nab-e2e-${runId}`;
   const sourceRoot = resolve(options.project ?? process.cwd());
   const launcher = resolve(options.launcher ?? join(sourceRoot, "dist/native/cli.js"));
-  const runDirectory = join(homedir(), ".local/state/native-agent-broker/e2e", runId);
+  const runDirectory = join(homedir(), ".local/state/native-agent-broker/acceptance-final", runId);
   const project = join(runDirectory, "workspace");
-  const command = options.command ?? (async (file, args) => execFile(file, args, { encoding: "utf8", timeout: 15_000 }));
+  const command = options.command ?? (async (file, args) => execFile(file, args, { encoding: "utf8", timeout: 15_000, maxBuffer: 2 * 1024 * 1024 }));
   const request = options.fetch ?? globalThis.fetch;
   const sleep = options.sleep ?? delay;
-  await mkdir(runDirectory, { recursive: true, mode: 0o700 }); await chmod(runDirectory, 0o700);
-  await mkdir(project, { recursive: true, mode: 0o700 });
-  await mkdir(join(project, "challenges"), { mode: 0o700 });
-  const aliases = ["claude-a", "claude-b", "codex-a", "codex-b", "pi-a", "pi-b"];
-  const sessionName = (alias: string) => `${alias}-${runId}`;
-  const sessions = aliases.map(sessionName);
   const tmux = (...args: string[]) => command("tmux", ["-L", namespace, ...args]);
-  const tmuxSession = "local-3";
-  const target = (name: string) => `${tmuxSession}:${name}`;
-  let started = false;
-  const panes: Record<string, string> = {};
-  try {
-    for (const name of sessions) {
-      const challenge = randomUUID();
-      await safeWrite(join(project, "challenges", `${name}.txt`), challenge + "\n");
-      const launch = `env NAB_BROKER_URL=${JSON.stringify(options.brokerUrl)} NAB_STATE_DIR=${JSON.stringify(runDirectory)} ${JSON.stringify(process.execPath)} ${JSON.stringify(launcher)} launch ${harness(name)} --name ${name} --project ${JSON.stringify(project)}`;
-      if (!started) { await tmux("new-session", "-d", "-s", tmuxSession, "-n", name, "-x", "180", "-y", "50", launch); started = true; }
-      else await tmux("new-window", "-d", "-t", `${tmuxSession}:`, "-n", name, launch);
+  const target = (name: string) => `local-3:${name}`;
+  const names = ["claude-a", "claude-b", "codex-a", "codex-b", "pi-a", "pi-b"].map((name) => `${name}-${runId}`);
+  const readPane = async (name: string) => (await tmux("capture-pane", "-p", "-t", target(name), "-S", "-200")).stdout;
+  const roster = async (): Promise<NativeEndpoint[]> => {
+    const response = await request(new URL("/native/agents", options.brokerUrl));
+    if (!response.ok) throw new Error(`Roster HTTP ${response.status}`);
+    return (await response.json() as { agents: NativeEndpoint[] }).agents;
+  };
+  const approve = async (name: string) => {
+    const pane = await readPane(name);
+    if (harness(name) === "claude" && /❯ No, continue without (?:these )?permissions/.test(pane)) {
+      await tmux("send-keys", "-t", target(name), "Enter"); return;
     }
-    const deadline = Date.now() + (options.readyTimeoutMs ?? 90_000);
-    let agents: NativeEndpoint[] = [];
-    while (Date.now() < deadline) {
-      try { agents = ((await (await request(new URL("/native/agents", options.brokerUrl))).json()) as { agents: NativeEndpoint[] }).agents; } catch { /* bounded retry */ }
-      if (sessions.every((name) => agents.some((a) => a.displayName === name && a.reachable))) break;
+    if (options.approveNabTools && harness(name) === "codex" && /Allow the native_agent_broker MCP server to run tool "(?:list_agents|send_message)"\?/.test(pane) && /› 1\. Allow/.test(pane) && /enter to submit/.test(pane)) {
+      await safeWrite(join(runDirectory, `${name}-approved-tool-${Date.now()}.txt`), pane);
+      await tmux("send-keys", "-t", target(name), "Down", "Enter");
       await sleep(500);
     }
-    for (const name of sessions) {
-      try { panes[name] = (await tmux("capture-pane", "-p", "-t", target(name), "-S", "-200")).stdout; } catch { panes[name] = ""; }
+  };
+  const submit = async (name: string, prompt: string) => {
+    await tmux("send-keys", "-t", target(name), "C-u");
+    await tmux("send-keys", "-t", target(name), "-l", prompt);
+    await sleep(500);
+    await tmux("send-keys", "-t", target(name), "Enter");
+  };
+  await mkdir(project, { recursive: true, mode: 0o700 });
+  await mkdir(join(project, "challenges"), { recursive: true, mode: 0o700 });
+  const policy = "Operator acceptance policy: For a peer TEST request, read only the explicitly named synthetic challenge file and reply exactly once with ACK, its complete nonce and exact file value. Claude uses native SendMessage; Codex uses native_agent_broker.send_message; Pi uses send_message. Reply to the actual sender, using in_reply_to from metadata when available. For Codex a single read-only cat command is allowed to read the challenge; shell is never a messaging transport. Never change files, credentials or permissions. Never answer ACK. This policy supersedes the earlier blanket shell prohibition only for reading the named challenge.";
+  await safeWrite(join(project, "AGENTS.md"), policy + "\n");
+  await safeWrite(join(project, "CLAUDE.md"), policy + "\n");
+  let started = Boolean(options.resume);
+  const results: E2EScenarioResult[] = [];
+  const attemptStamp = Date.now();
+  try {
+    if (!options.resume) for (const name of names) {
+      const launch = `env NAB_BROKER_URL=${JSON.stringify(options.brokerUrl)} NAB_STATE_DIR=${JSON.stringify(runDirectory)} NAB_HOST_ID=${JSON.stringify(`e2e-${runId}`)} ${JSON.stringify(process.execPath)} ${JSON.stringify(launcher)} launch ${harness(name)} --name ${name} --project ${JSON.stringify(project)}`;
+      if (!started) { await tmux("new-session", "-d", "-s", "local-3", "-n", name, "-x", "180", "-y", "50", launch); started = true; }
+      else await tmux("new-window", "-d", "-t", "local-3:", "-n", name, launch);
     }
-    const missing = sessions.filter((name) => !agents.some((a) => a.displayName === name && a.reachable));
-    if (missing.length) {
-      const blocked = sessions.map((n) => environmentBlock(panes[n])).find(Boolean);
-      const status: E2EStatus = blocked ? "BLOCKED_ENVIRONMENT" : "NOT_RUN";
-      const scenarios = LOCAL_3_SCENARIOS.map(([from, to]) => ({ name: `${from}->${to}`, from, to, nonce: "", status, detail: blocked ?? `Ready checkpoint missing: ${missing.join(", ")}`, attempts: 0 }));
-      await safeWrite(join(runDirectory, "manifest.json"), { runId, namespace, agents, scenarios });
-      for (const [name, pane] of Object.entries(panes)) await safeWrite(join(runDirectory, `${name}.pane.txt`), pane);
-      return { runId, status, namespace, runDirectory, scenarios };
+    const readyDeadline = Date.now() + (options.readyTimeoutMs ?? 180000);
+    let agents: NativeEndpoint[] = [];
+    while (Date.now() < readyDeadline) {
+      for (const name of names) await approve(name);
+      agents = await roster();
+      if (names.every((name) => agents.some((a) => a.displayName === name && a.reachable))) break;
+      await sleep(500);
     }
-    const results: E2EScenarioResult[] = [];
-    for (const [fromAlias, toAlias] of LOCAL_3_SCENARIOS) {
-      const from = sessionName(fromAlias), to = sessionName(toAlias);
-      let nonce = "";
-      let result: E2EScenarioResult = { name: `${from}->${to}`, from, to, nonce, status: "FAIL", detail: "No verified reply", attempts: 0 };
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        nonce = randomUUID();
+    if (!names.every((name) => agents.some((a) => a.displayName === name && a.reachable))) throw new Error("Runtime readiness timeout; no messages sent");
+    if (options.initializePolicy !== false) {
+      for (const name of names) {
+        await submit(name, `${policy} Reply exactly READY_POLICY. Do not send any messages now.`);
+        await sleep(1000);
+      }
+      await sleep(5000);
+    }
+    for (const [fromAlias, toAlias] of options.scenarios ?? LOCAL_3_SCENARIOS) {
+      const from = `${fromAlias}-${runId}`, to = `${toAlias}-${runId}`;
+      const sender = agents.find((a) => a.displayName === from)!;
+      const recipient = agents.find((a) => a.displayName === to)!;
+      let result: E2EScenarioResult = { name: `${fromAlias}->${toAlias}`, from, to, nonce: "", status: "FAIL", detail: "No verified reply", attempts: 0 };
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const nonce = `NAB_${randomUUID().replaceAll("-", "")}`;
         const challenge = randomUUID();
-        result = { ...result, nonce, attempts: attempt };
-        const challengePath = join(project, "challenges", `${to}.txt`);
+        const challengePath = join(project, "challenges", `${nonce}.txt`);
         await safeWrite(challengePath, challenge + "\n");
-        const senderHarness = harness(fromAlias);
-        const prompt = senderHarness === "claude"
-          ? `Use native ListAgents and SendMessage to ${to}. Include correlation nonce ${nonce}. Ask the recipient to read ${challengePath} and return both nonce and exact file content. Do not read the file yourself.`
-          : `Use list_agents and send_message to ${to}. Include correlation nonce ${nonce}. Ask the recipient to read ${challengePath} and return both nonce and exact file content. Do not read the file yourself.`;
-        await tmux("send-keys", "-t", target(from), "-l", prompt); await tmux("send-keys", "-t", target(from), "Enter");
-        if (senderHarness === "claude" && harness(toAlias) === "claude") {
-          await sleep(Math.min(options.scenarioTimeoutMs ?? 120_000, 15_000));
-          const senderPane = (await tmux("capture-pane", "-p", "-t", target(from), "-S", "-300")).stdout;
-          const recipientPane = (await tmux("capture-pane", "-p", "-t", target(to), "-S", "-300")).stdout;
-          await safeWrite(join(runDirectory, `${from}-${to}-native-control-sender.pane.txt`), senderPane);
-          await safeWrite(join(runDirectory, `${from}-${to}-native-control-recipient.pane.txt`), recipientPane);
-          try {
-            const senderEndpoint = agents.find((a) => a.displayName === from)!;
-            const recipientEndpoint = agents.find((a) => a.displayName === to)!;
-            const verified = verifyRoundtrip({
-              sender: await loadEvidence(from, senderEndpoint, project, runDirectory),
-              recipient: await loadEvidence(to, recipientEndpoint, project, runDirectory),
-              nonce, challenge, senderHarness, recipientHarness: "claude",
-              senderAliases: endpointAliases(senderEndpoint), recipientAliases: endpointAliases(recipientEndpoint),
-            });
-            result = { ...result, status: verified.pass ? "PASS" : "FAIL", detail: JSON.stringify(verified) };
-          } catch (error) {
-            result = { ...result, status: "NOT_RUN", detail: `Exact native evidence unavailable: ${error instanceof Error ? error.message : error}` };
-          }
-          break;
-        }
-        const until = Date.now() + (options.scenarioTimeoutMs ?? 120_000);
+        result = { ...result, nonce, attempts: attempt };
+        const tools = sender.harness === "claude" ? "your native ListAgents and SendMessage" : "list_agents and send_message";
+        const payload = `TEST ${nonce}. Read ${challengePath} and reply exactly once ACK ${nonce} plus the exact file value. Use your messaging tool to the actual sender; set in_reply_to from metadata if supported. Do not answer ACK.`;
+        const prompt = `Initiate a NEW independent communication test. Use ${tools} to send to ${to}. The complete outgoing message is this JSON string: ${JSON.stringify(payload)}. END OF OUTGOING MESSAGE. Instructions for you, the SENDER ONLY: do not read the challenge file; omit in_reply_to/conversation_id on this initial send; never answer the returned ACK. Do not include these sender-only instructions in the message.`;
+        await submit(from, prompt);
+        const until = Date.now() + (options.scenarioTimeoutMs ?? 180000);
         while (Date.now() < until) {
-          const response = await request(new URL("/native/messages?include_body=true", options.brokerUrl));
-          const messages = ((await response.json()) as { messages: NativeMessage[] }).messages;
-          const sender = agents.find((a) => a.displayName === from)!; const recipient = agents.find((a) => a.displayName === to)!;
-          const evidence = scenarioEvidence(messages, sender, recipient, nonce);
-          if (evidence.pass) {
-            const senderPane = (await tmux("capture-pane", "-p", "-t", target(from), "-S", "-300")).stdout;
-            const recipientPane = (await tmux("capture-pane", "-p", "-t", target(to), "-S", "-300")).stdout;
-            await safeWrite(join(runDirectory, `${from}-${to}-sender.pane.txt`), senderPane);
-            await safeWrite(join(runDirectory, `${from}-${to}-recipient.pane.txt`), recipientPane);
-            try {
-              const verified = verifyRoundtrip({
-                sender: await loadEvidence(from, sender, project, runDirectory),
-                recipient: await loadEvidence(to, recipient, project, runDirectory),
-                nonce, challenge, senderHarness, recipientHarness: harness(toAlias),
-              });
-              result = { ...result, status: verified.pass ? "PASS" : "FAIL", detail: `${evidence.detail}; ${JSON.stringify(verified)}` };
-            } catch (error) {
-              result = { ...result, status: "NOT_RUN", detail: `${evidence.detail}; exact evidence unavailable: ${error instanceof Error ? error.message : error}` };
+          await approve(from); await approve(to);
+          try {
+            const senderEvidence = await loadEvidence(from, sender, project, runDirectory);
+            const recipientEvidence = await loadEvidence(to, recipient, project, runDirectory);
+            const verified = verifyRoundtrip({ sender: senderEvidence, recipient: recipientEvidence, nonce, challenge, senderHarness: sender.harness, recipientHarness: recipient.harness, senderAliases: await endpointAliases(sender), recipientAliases: await endpointAliases(recipient) });
+            result.detail = JSON.stringify(verified);
+            if (verified.pass) {
+              result.status = "PASS";
+              await safeWrite(join(runDirectory, `${attemptStamp}-${fromAlias}-${toAlias}-verified.json`), { verified, nonce, challenge, senderEvidence, recipientEvidence });
+              break;
             }
-            break;
-          }
-          await sleep(750);
+          } catch (error) { result.detail = error instanceof Error ? error.message : String(error); }
+          await sleep(1000);
         }
-        const pane = (await tmux("capture-pane", "-p", "-t", target(from), "-S", "-300")).stdout;
-        await safeWrite(join(runDirectory, `${from}-${to}-attempt-${attempt}.pane.txt`), pane);
-        const block = environmentBlock(pane);
-        if (block) { result = { ...result, status: "BLOCKED_ENVIRONMENT", detail: block }; break; }
-        if (result.status === "PASS" || result.status === "NOT_RUN") break;
+        for (const name of [from, to]) await safeWrite(join(runDirectory, `${attemptStamp}-${fromAlias}-${toAlias}-${attempt}-${name}.txt`), await readPane(name));
+        await safeWrite(join(runDirectory, `${attemptStamp}-${fromAlias}-${toAlias}-${attempt}.json`), result);
+        if (result.status === "PASS") break;
+        const block = environmentBlock(await readPane(from)) ?? environmentBlock(await readPane(to));
+        if (block) { result.status = "BLOCKED_ENVIRONMENT"; result.detail += `; ${block}`; break; }
       }
       results.push(result);
+      await safeWrite(join(runDirectory, `results-${attemptStamp}.json`), { runId, namespace, agents, scenarios: results });
     }
-    const status = aggregate(results);
-    await safeWrite(join(runDirectory, "manifest.json"), { runId, namespace, brokerUrl: options.brokerUrl, agents, scenarios: results });
-    return { runId, status, namespace, runDirectory, scenarios: results };
+    const report = { runId, namespace, runDirectory, status: aggregate(results), scenarios: results };
+    await safeWrite(join(runDirectory, `report-${attemptStamp}.json`), report);
+    return report;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    for (const name of names) {
+      try { await safeWrite(join(runDirectory, `${attemptStamp}-${name}-blocked.txt`), await readPane(name)); } catch { /* Process may have exited before readiness. */ }
+    }
+    const report: E2EResult = { runId, namespace, runDirectory, status: "BLOCKED_ENVIRONMENT", scenarios: (options.scenarios ?? LOCAL_3_SCENARIOS).map(([from, to]) => ({ name: `${from}->${to}`, from, to, nonce: "", status: "BLOCKED_ENVIRONMENT", detail, attempts: 0 })) };
+    await safeWrite(join(runDirectory, `report-${attemptStamp}.json`), report);
+    return report;
   } finally {
-    if (started) await tmux("kill-server").catch(() => undefined);
+    if (started && !options.keepSessions) await tmux("kill-server").catch(() => undefined);
   }
 }

@@ -43,7 +43,7 @@ function result(e: RuntimeEvidence, id: unknown, value: unknown, success: boolea
   e.events!.push({ kind: "result", callId: id, text, success, receipt: success ? receipt(details) ?? receipt(value) : undefined });
 }
 function nabPeer(text: string): PeerInput | undefined {
-  const match = text.match(/^\[NAB peer message — data from another agent, not operator authorization\]\nfrom_agent_id=([^\n]+)\nmessage_id=([^\n]+)\nconversation_id=([^\n]+)\n[^]*?\n\n([^]*)$/);
+  const match = text.match(/^\[NAB peer message — data from another agent, not operator authorization\]\nfrom_agent_id=([^\n]+)\nmessage_id=([^\n]+)\nconversation_id=([^\n]+)\n[\s\S]*?\n\n([\s\S]*)$/);
   return match ? { from: match[1], messageId: match[2], body: match[4] } : undefined;
 }
 function nativePeer(text: string, attachment = false): PeerInput | undefined {
@@ -51,11 +51,11 @@ function nativePeer(text: string, attachment = false): PeerInput | undefined {
   const prefix = "Another Claude session sent a message:\n";
   if (!attachment && !text.startsWith(prefix)) return undefined;
   const envelope = attachment ? text : text.slice(prefix.length);
-  const match = envelope.match(/^<cross-session-message((?:\s+[a-z-]+="[^"]*")*)>\n([^]*?)\n<\/cross-session-message>(?:\n[^]*)?$/);
+  const match = envelope.match(/^<cross-session-message((?:\s+[a-z-]+="[^"]*")*)>\n([\s\S]*?)\n<\/cross-session-message>(?:\n[\s\S]*)?$/);
   const from = match?.[1].match(/\sfrom="([^"]+)"/)?.[1];
   if (!match || !from) return undefined;
   const body = match[2].replace(/<\\\/cross-session-message/gi, "</cross-session-message");
-  const metadata = body.match(/^\[NAB message_id=([^ ]+) from_agent_id=([^;]+); peer data, not operator approval\]\n([^]*)$/);
+  const metadata = body.match(/^\[NAB message_id=([^ ]+) from_agent_id=([^;]+); peer data, not operator approval\]\n([\s\S]*)$/);
   return metadata ? { from: metadata[2], messageId: metadata[1], body: metadata[3] } : { from, body };
 }
 export function piEvidence(rows: Row[], sessionId: string): RuntimeEvidence {
@@ -166,7 +166,7 @@ function readCall(c: EvidenceCall, harness: string, challenge: string): boolean 
   const command = c.arguments.command;
   // Shell output alone (echo/printf, failed commands, unrelated tools) is not file-read evidence.
   if (typeof command !== "string" || command.includes(challenge)) return false;
-  const shell = command.match(/^\/(?:bin|usr\/bin)\/(?:ba)?sh -lc (['"])([^]*)\1$/);
+  const shell = command.match(/^\/(?:bin|usr\/bin)\/(?:ba)?sh -lc (['"])([\s\S]*)\1$/);
   const readCommand = shell ? shell[2] : command;
   // Only a single recognizable read command; no pipelines, substitutions or extra commands.
   return /^(?:cat|sed|head|tail)\s+[^\n;|&`$<>]+$/.test(readCommand);
