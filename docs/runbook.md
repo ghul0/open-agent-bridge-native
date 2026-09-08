@@ -1,61 +1,88 @@
-# Codzienna obsługa LOCAL_3
+# Codzienna obsługa centralnego NAB
 
-Bieżący runtime release: **0.1.0-9066780**. Instalacja lokalna została uruchomiona i przetestowana. Szczegółowy runbook z prywatnymi ścieżkami: `~/.local/state/native-agent-broker/runbook.md`. Status pełnego odbioru w implementation-status.md.
+Runtime release **0.2.0-52c3dc2**. Jeden `codex-app-server.service`, jeden `nab-broker.service` i kliencki `nab-host.service`. Host adapter nie jest drugim brokerem. Szczegółowy lokalny runbook: `~/.local/state/native-agent-broker/runbook.md`.
 
-## Start i diagnostyka
+## Codex — natywnie
 
 ```bash
-oab-native service start
-oab-native service stop
-oab-native service restart
-oab-native service status
-oab-native doctor --json
-oab-native agents --json
+codex
+# albo istniejący skrót coy
 ```
 
-systemd --user: `nab-broker.service`, `nab-host.service`; restart z backoffem i start przy uruchomieniu menedżera usług użytkownika. Nie włączano linger. Usługi nie inicjują zadań modeli. Po restarcie odczekaj na reconnect; doctor zgłasza brak wymaganej sesji, a nie udaje gotowości.
+W zweryfikowanym środowisku zwykłe TUI automatycznie dołącza do istniejącej centrali. NAB nie uruchamia Codexa ani App Servera. `oab-native launch codex` jest wyłączone i wyjaśnia użycie native CLI.
 
-## Sesje
+Nazwę nadajesz natywnie w TUI:
+
+```text
+/rename reviewer
+```
+
+NAB odczytuje thread.name; threadId pozostaje stałą tożsamością. Agent dostaje informację o nazwie, a bieżąca nazwa znajduje się też w metadata odbiorcy i self narzędzia list_agents. Niejednoznacznych nazw nie rozwiązuje się przez wybór pierwszej sesji.
+
+Operator może użyć API bez wrappera:
+
+```bash
+oab-native codex status
+oab-native codex rename THREAD_ID reviewer
+codex resume THREAD_ID
+```
+
+`--name` nie jest flagą Codexa. Jawne `codex --remote unix://…` pozostaje natywnym sposobem wyboru serwera w diagnostyce; nie jest wymagane przez NAB. Niektóre flagi `-c`/profile lub niedostępność daemona mogą spowodować osobny embedded runtime — doctor raportuje duplikaty, nie zabija ich automatycznie.
+
+## Pozostałe harnessy i usługi
 
 ```bash
 oab-native launch claude --name claude-orchestrator --project "$PWD"
-oab-native launch codex --name codex-reviewer --project "$PWD"
 oab-native launch pi --name pi-researcher --project "$PWD"
+oab-native service status
+oab-native service start
+oab-native service stop
+oab-native service restart
+oab-native doctor --json
 ```
 
-Claude używa natywnych ListAgents/SendMessage. Codex i Pi używają list_agents/send_message; odbiór nie wymaga pollingu przez model. Codex launcher uruchamia osobny App Server i remote TUI tego samego threadId. Krótki modelowy marker potwierdza attach, a dopiero potem endpoint trafia do rosteru. Własne MCP i autoryzacje użytkownika pozostają, a narzędzia NAB wymagają normalnych zgód harnessu.
-
-Pi jest czystą izolowaną instalacją 0.85.1. Globalne custom Pi i rozszerzenia nie są usuwane. Nowe sesje nie dostają automatycznej zgody na zadania od peerów: obowiązują ich instrukcje i uprawnienia.
-
-## Historia i backup
+NAB service polecenia dotyczą wyłącznie brokera i host adaptera. Centralny Codex jest niezależny:
 
 ```bash
+systemctl --user status codex-app-server.service
+```
+
+Nie restartuj go podczas cudzych aktywnych tur bez uzgodnienia. TUI może wykonać reconnect, ale niepewne operacje nie są automatycznie ponawiane. `codex app-server proxy` używany przez SSH jest klientem centrali, nie dodatkowym runtime — nie zabijać go jako duplikatu.
+
+## Narzędzia, historia i backup
+
+Claude korzysta z prawdziwych ListAgents/SendMessage. Codex/Pi: list_agents/send_message, push przez runtime. Codex sender z `_meta.threadId`, nie pliku bindingu ani argumentu from.
+
+```bash
+oab-native agents --json
 oab-native messages
-oab-native messages --follow
 oab-native messages --include-body
 oab-native messages --agent AGENT_ID --include-body
 oab-native backup --to "$HOME/.local/state/native-agent-broker/backup-new.sqlite"
 oab-native capture status
 ```
 
-Domyślnie bez treści. Backup używa VACUUM INTO, nie kopii aktywnego pliku WAL; cel musi nie istnieć. Zachowaj plik `.initialized` razem z backupem. Utrata znanej bazy zatrzymuje przyjęcia zamiast tworzyć pozornie poprawną pustą historię.
+Backup VACUUM INTO plus `.initialized`; cel musi nie istnieć. `accepted` nie oznacza odczytu, `runtime_accepted` wymaga receipt, `delivery_unknown` nie upoważnia do ślepego retry. Native odpowiedź Claude może nie mieć inReplyTo. Ruch bezpośredni Claude↔Claude nie jest przechwytywany.
 
-`accepted` nie znaczy model response. `runtime_accepted` wymaga runtime evidence, `held` oznacza politykę odbiorcy, `responded` skorelowaną wiadomość. `delivery_unknown` nie upoważnia do ślepego resend; normalny native Claude nie zawsze zwraca receipt. Native odpowiedź może nie mieć inReplyTo. Capture obejmuje tylko ruch przez NAB.
-
-## Instalacja i aktualizacja
-
-W zweryfikowanym checkout:
+## Setup i aktualizacja
 
 ```bash
 pnpm install --frozen-lockfile --ignore-scripts
 pnpm build
 node dist/native/cli.js setup --local --harnesses claude,codex,pi --release VERSION
-node dist/native/cli.js service install --user --start --manifest MANIFEST_PATH
+oab-native codex configure
+oab-native service install --user --start --manifest MANIFEST_PATH
 ```
 
-Wartości VERSION i MANIFEST_PATH odnoszą się do sprawdzanego release; setup wypisuje rzeczywisty manifest. Opcja `--release` celowo nie nazywa się `--version`, bo ta wyświetla wersję CLI. `NAB_BROKER_URL` może wskazać wybrany wolny port; instalator nie zatrzymuje obcej usługi.
+`codex configure` minimalnie dodaje docelowy MCP do konfiguracji Codexa i wywołuje MCP reload bez restartu runtime. Parser wymaga Python3.11+ tomllib. Backup/hash manifest zachowuje pozostałe ustawienia i MCP. Nie kopiuje OAuth. Zmiany poza zarządzanym blokiem nie są nadpisywane. Gdy potrzebny restart centrali, wykonaj go świadomie oddzielnie.
 
-Release jest samowystarczalny poza checkout. Manifest ownership, hashe i backupy chronią istniejące oraz późniejsze zmiany. Poprzedni release pozostaje dostępny. Rollback i uninstall opisano w rollback.md.
+Migracja starszych własnych adapterów po ich zatrzymaniu:
+
+```bash
+oab-native codex migrate-bindings --from codex:OLD_NAME
+```
+
+Zwrócony manifest służy do CAS rollback; nie migruj obcych endpointów. Szczegóły w rollback.md. Usługi nie wymagają sudo ani linger i nie inicjują zadań modeli przy starcie poza jawnymi powiadomieniami identity nowych/zmienionych sesji.
 
 ## E2E i drugi host
 
@@ -63,8 +90,6 @@ Release jest samowystarczalny poza checkout. Manifest ownership, hashe i backupy
 oab-native e2e --suite local-3 --tmux
 ```
 
-Oddzielny namespace, ograniczone próby i prawdziwe runtime evidence. Brak logowania, approval albo trace nie daje PASS. Końcowy replay obejmuje wszystkie 9 scenariuszy, z udokumentowanym retest po zgodzie użytkownika; niezależny review potwierdził evidence.
+Runner korzysta z centrali i prawdziwego TUI. `--approve-nab-tools` to wyłącznie jawna sesyjna zgoda operatora na dwa narzędzia NAB w testowym Codexie. Brak auth/approval/trace nie daje PASS. `--run-id`, `--resume`, `--keep-sessions` pozwalają diagnozować własne testy.
 
-Opcje `--run-id ID --keep-sessions` pozwalają zachować własne testy do dalszej diagnostyki, a `--resume --run-id ID` wznowić tę samą przestrzeń. Użycie `--approve-nab-tools` jest jawną zgodą operatora wyłącznie na sesyjne list_agents/send_message NAB w utworzonych testowych Codexach. Nie zatwierdza innych narzędzi. Native Claude nadal wymaga własnych dozwolonych ListAgents/SendMessage; odmowa nie jest obchodzona. Po diagnostyce zamknij wyłącznie swój `tmux -L nab-e2e-ID`, nigdy domyślny serwer tmux.
-
-Drugi host: ten sam release, własny stabilny hostId i brokerUrl, kontrolowana sieć/tunel. Uruchamia tylko lokalny adapter (`oab-native host`) oraz swoje launchery; centralny broker nie korzysta z jego filesystemu. Sieć jest granicą zaufania — brak auth NAB. Nie udostępniaj App Serverów/socketów. Dwa logiczne hosty przetestowano lokalnie, nie deklarujemy dwóch rzeczywistych maszyn.
+Drugi host: własny hostId, brokerUrl i lokalny adapter. Bez współdzielenia socketów czy udostępniania App Servera do Internetu; sieć/tunel stanowi granicę zaufania. Sprawdzono dwa logiczne hosty, nie dwie fizyczne maszyny. Antigravity i native capture poza MVP.

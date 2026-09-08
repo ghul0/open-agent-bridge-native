@@ -1,23 +1,34 @@
-# Migracja na centralny Codex
+# Odbiór centralnego Codexa
 
-Status: **IMPLEMENTED_E2E_RUNNING**. Historyczne DONE_LOCAL_3 nie zastępuje odbioru tej architektury.
+**DONE_LOCAL_3_SHARED_CODEX**, 2026-09-08. Runtime release **0.2.0-52c3dc2**, commit `52c3dc2`. Zastępuje historyczny wariant per-session App Server.
 
 ## Potwierdzone live
 
-- Jedna istniejąca usługa codex-app-server.service, bez restartu w trakcie migracji. Dodatkowy historyczny runtime demo NAB zamknięty po sprawdzeniu właściciela i zachowaniu historii. Aktualny licznik:1 runtime +1 SSH proxy; Node launchers nie są liczone jako serwery.
-- SSH app-server proxy jest klientem centrali, pozostał nietknięty.
-- Dwa prawdziwe TUI Codexa bez wrappera, bez -c i bez --remote: ten sam cwd, różne native thread IDs. Jeden wątek utworzony przez API i po pierwszej trwałej turze dołączony natywnym resume, drugi utworzony zwykłym codex.
-- Dwa rzeczywiste calls probe list_agents przekazały różne, poprawne extra._meta.threadId. Docelowe list_agents/send_message NAB wykorzystują metadata, nie binding file.
-- Request approval widoczny w dodatkowym RPC subscriberze nie został przez niego rozstrzygnięty. Natywne TUI obsłużyło zgodę użytkownika; serverRequest/resolved potwierdzony.
-- thread/name/set → thread/name/updated → roster/projekcja → deduplikowana wiadomość o własnej nazwie w kontekście modelu. Model odpowiedział swoją prawidłową nazwą.
-- Native Claude→shared Codex→Claude oraz shared Codex→shared Codex→pierwotny thread działają z challenge. Pierwsza próba modelu podała nieprawidłowe argumenty MCP, potem błędnie skróciła challenge — zachowana jako FAIL. Nowy jednoznaczny test odczytu przeszedł, nie naprawiano odpowiedzi za model.
+- Jeden runtime `codex-app-server.service`; historyczny dodatkowy App Server NAB zamknięty po sprawdzeniu własności. SSH proxy pozostało klientem centrali. Doctor: runtimeCount=1, proxyCount=1, exit0.
+- Dwa prawdziwe TUI Codexa bez wrappera, -c i --remote, ten sam cwd i różne thread IDs. Jeden testowy wątek utworzono przez API, po pierwszej trwałej turze dołączono natywne resume. Drugi powstał przez zwykły codex.
+- Rzeczywiste modelowe calls przekazują odmienne extra._meta.threadId. Docelowe list_agents/send_message identyfikują nadawcę wyłącznie z metadata i rosteru, nie pliku bindingu lub argumentu from.
+- Dodatkowy subscriber obserwował mcpServer/elicitation/request bez odpowiedzi; natywne TUI obsłużyło zgodę użytkownika, a serverRequest/resolved zakończyło oczekiwanie. Nie automatyzowano approval narzędzi shellowych.
+- Natywne API rename oraz /rename propagują nazwę do rosteru/projekcji, zachowując threadId. Model otrzymuje deduplikowane powiadomienie; current recipient name dodatkowo w metadanych wejścia. Model poprawnie odpowiedział aktualną nazwą po retest.
+- **9/9 nowej macierzy E2E PASS, każdy scenariusz w pierwszej próbie tej macierzy**: sześć kierunków cross-harness + Codex/Pi diagonal + native Claude control. Niezależny reviewer potwierdził exact session participants, successful calls, read challenge i return input. Wcześniejsze osobne probe failures zachowane.
+- Busy Codex: w tym samym turnie wejście TEST, read challenge, completed send_message, pierwotne zadanie BUSY_SHARED_FINISHED; brak nowego hidden thread.
+- Po kontrolowanym restarcie centrali za jawną zgodą użytkownika native TUI wykonał reconnect bez ponowienia inputu. Ten sam thread ID wrócił na loaded/list. Po wdrożeniu finalnego NAB nowy smoke reply dotarł do Claude z poprawnym challenge i nazwą.
+- Name notifications: jedna dla pierwszego wątku; dla drugiego tylko przy faktycznych zmianach nazwy. Reconnect adaptera nie dublował powiadomień.
 
-## Implementacja
+## Weryfikacja kodu i migracji
 
-CodexConnection (UDS WebSocket Hostlocalhost), CodexHost z jednym połączeniem i snapshotem loaded threads, synchronizacja natywnych nazw, approvals observer, start/steer, reconnect. MCP wymaga canonical threadId metadata i aktywnego endpointu. ChannelStore zapewnia transakcyjną migrację owner i identity+message, queue/rate limits. CLI odmawia wrapperowego launch codex; operator używa zwykłego codex i /rename. Osobne codex status/rename/configure/migrate-bindings nie uruchamiają serwera.
+**311 testów źródłowych / 39 plików PASS**, build/typecheck/lint PASS. Reconcile serializowany; metadata missing/wrong/offline fail closed; migracja owner używa produkcyjnego klucza [hostId,adapterId], zachowuje historię i ma CAS rollback. Identity+queued message są atomowe z queue/rate limitami. Jeden RegistryServer i jedna SQLite — bez drugiego brokera.
 
-Konfiguracja dodawana minimalnym merge TOML z backupem/hashami. Temporary nab_shared_probe jest wyłączony do czasu zamknięcia dwóch probe threadów, ponieważ per-thread override wymaga obecności kompletnego transportu podczas MCP reload; po cleanup wpis zostanie usunięty. Docelowy server MCP pozostaje native_agent_broker.
+Tymczasowy probe MCP został usunięty. Trzy dotychczasowe MCP pozostały bez zmian; dodano tylko native_agent_broker. Późniejsze zmiany ustawień zaufania projektów, wykonane równolegle przez harness, zachowano. Probe per-thread overrides wymagały restartu centrali, aby usunąć cache konfiguracji; restart wykonano dopiero po zgodzie człowieka.
 
-## Odbiór w toku
+## Zachowane niepowodzenia
 
-Nowa macierz9 na centralnej usłudze i natywnych klientach, dodatkowe busy/name/reconnect, review, kontrolowany release, aktualizacja dokumentacji i shared reports. Nie deklarujemy pełnego PASS zanim te bramki się zakończą. Prywatne dowody: katalog stanu shared-migration i acceptance-final/sharedfinal.
+- Pusty API thread/start→name/set→disconnect bez trwałej tury: resume odmówiło no rollout found. Nie ukryto tego dodatkowym wątkiem.
+- NDJSON do proxy nie działa, ponieważ control socket wymaga WebSocket framing. Klient ws wymaga też Host:localhost; poprawny handshake i RPC potwierdzone.
+- Pierwszy modelowy reply użył złych argumentów, a następnie skrócił challenge. To FAIL testu challenge, nie PASS. Nowa jednoznaczna próba read/reply przeszła.
+- Jedna odpowiedź modelu przypomniała starą nazwę mimo powiadomienia. Dodano current name do routing metadata/self; retest bieżącej nazwy przeszedł.
+
+## Granice
+
+Loaded oznacza sesję załadowaną w runtime, nie gwarancję konkretnego widoku TUI. Broker nie przejmuje historii i nie tworzy modeli do discovery. Nie gwarantuje odpowiedzi modelu na dowolny prompt. Native Claude nie zawsze daje receipt — wtedy delivery_unknown. Globalne zablokowanie dowolnego embedded/ws/stdio Codex nie jest funkcją natywnego CLI; NAB nie tworzy duplikatów i doctor je wykrywa. Antigravity, fizyczny drugi host i native capture poza MVP.
+
+Prywatne dowody: shared-migration/final-e2e.json, live-gates.json, mcp-meta-probe.jsonl, thread-a-final.json, thread-b-final.json, identity-dedup-evidence.json i acceptance-final/sharedfinal/*verified.json w katalogu stanu NAB. Nie trafiają do publicznego repo.

@@ -1,29 +1,34 @@
-# Raport końcowy LOCAL_3
+# Raport końcowy centralnego Codexa
 
-**DONE_LOCAL_3.** Odbiór zakończony 2026-09-08. Wdrożony runtime commit **9066780**, release **0.1.0-9066780**. Repozytorium: https://github.com/ghul0/open-agent-bridge-native; PR: https://github.com/ghul0/open-agent-bridge-native/pull/1.
+**DONE_LOCAL_3_SHARED_CODEX**, 2026-09-08. Runtime release **0.2.0-52c3dc2**, commit `52c3dc2`. Repo: https://github.com/ghul0/open-agent-bridge-native, PR: https://github.com/ghul0/open-agent-bridge-native/pull/1.
 
-## Wynik
+## Co zmieniono
 
-- Jeden istniejący RegistryServer i ChannelStore SQLite rozbudowany o native profile, trwały outbox, statusy, kolejkę, TTL, idempotencję i routing do przypisanego adaptera.
-- Claude używa prawdziwych ListAgents/SendMessage; Codex ma kontrolowany App Server i ten sam widoczny TUI/thread; Pi 0.85.1 działa jako czysta izolowana instalacja z extension.
-- **9/9 scenariuszy live PASS**: sześć cross-harness, Codex↔Codex, Pi↔Pi i kontrola native Claude↔Claude. Automatyczny replay zakończył 8 scenariuszy; jeden blokowany przez native classifier powtórzono po jawnej zgodzie użytkownika w tej samej sesji. Wszystkie końcowe próby przeszły rygorystyczny oracle i niezależny review.
-- Busy Codex `turn/steer` z expectedTurnId = turnId, busy Pi, odczyt nieznanego challenge oraz rzeczywiste odpowiedzi. Dodatkowo trzy wymiany pamięci 29 → 88 → recall na tym samym Pi sessionId.
-- Rzeczywisty shutdown testowego Codexa zamknął wszystkie jego procesy, a sąsiedni Codex pozostał aktywny. Po zakończeniu odbioru zamknięto wyłącznie własny namespace testowy i sprawdzono brak orphanów.
-- **283 unikalne testy źródłowe / 33 pliki PASS**; build, typecheck i lint PASS. Skopiowane testy dist nie są ponownie liczone.
-- Realne SQLITE_FULL, readonly permissions, brak DB z markerem, przerwany/obcy ACK, replay/lease/FIFO/TTL/rate-limit oraz odtworzenie backupu. Dwa logiczne hosty testowane lokalnie.
+- Usunięto launcher Codexa tworzący App Server per sesja. Codex/coy działają natywnie; istniejąca usługa centralna jest jedynym runtime.
+- SSH app-server proxy zachowano jako klienta centrali. Doctor liczy runtime oddzielnie od proxy i Node launchera; końcowy wynik1 runtime +1 proxy.
+- Jeden CodexHost obsługuje wiele loaded threads przez WebSocket-over-UDS. Brak polling narzędziem modelu i brak importu całej historii jako online.
+- Narzędzia nadal tylko list_agents/send_message; nadawca z extra._meta.threadId i zweryfikowanego endpointu. Brak from od modelu i per-session binding file.
+- Natywne thread.name, /rename, thread/name/set są źródłem nazw NAB. Model dostaje deduplikowane powiadomienie, a bieżąca nazwa jest w metadanych odbiorcy i self list_agents.
+- Własność starego demo przeniesiono transakcyjnie do codex-central bez zmiany agentId/historii; stary dodatkowy runtime zamknięto po sprawdzeniu właściciela.
+
+## Odbiór
+
+**9/9 nowej macierzy live PASS**, wszystkie scenariusze pierwszym podejściem w tej macierzy. Odrębne wcześniejsze probe błędy zachowano. Niezależny reviewer potwierdził komplet ordered tool/result/input/read/reply dla właściwych sesji.
+
+Dwa native TUI bez wrappera i --remote, jeden cwd, dwie tożsamości metadata; native Claude tools; busy same-turn steering; rename i wiedza modelu; durable identity dedup po reconnect; approvals widoczne w TUI przy biernym observerze adaptera. Centralny restart wykonano dopiero po jawnej zgodzie użytkownika; TUI odzyskał ten sam thread bez automatycznego resend.
+
+**311 testów źródłowych / 39 plików PASS**, build, typecheck i lint PASS. Dotychczasowe storage/fault/rollback/native protocol testy pozostały. Dodano tests UDS Host header, multiplexing, metadata, nazw/state/reconcile, ownership CAS, identity transaction i config merge.
 
 ## Wdrożenie
 
-Dwie usługi `nab-broker.service` i `nab-host.service` są **active/enabled** w systemd --user. Broker nasłuchuje na loopback, `doctor --json` kończy się sukcesem. Release leży poza checkout. Po aktualizacji usług rzeczywiste sesje odzyskały połączenie, a Codex i Pi odpowiedziały na nowe wyzwanie przez native Claude. Backup VACUUM INTO wykonano na działającej bazie.
+`codex-app-server.service`, `nab-broker.service`, `nab-host.service` są active; usługi użytkownika enabled. Host NAB jest adapterem/klientem, nie drugim brokerem. Broker loopback4997. Finalny doctor exit0. Release poza checkout, docelowy MCP wskazuje jego plik. Po wdrożeniu realny reply z poprawnym challenge i aktualną nazwą wrócił do native Claude.
 
-Pozostawiono trzy bezczynne demonstracje w prywatnym tmux `nab-local3`, okna `demo-claude`, `demo-codex`, `demo-pi`. Nie pozostawiono pętli agentów. Lokalny runbook i manifesty są poza repo; wersja publiczna w runbook.md / rollback.md.
+Tymczasowy probe MCP usunięto; oryginalne MCP zachowano. Późniejsze zmiany trust projektów nie zostały nadpisane. Zachowano manifesty/backups release, MCP i ownership. Cztery testowe Claude/Pi i testowy Codex z override zamknięto, pozostawiając jeden natywny Codex o nazwie `nab-codex-native` oraz wcześniejsze demonstracje Claude/Pi.
 
-## Zachowane ograniczenia
+## Granice
 
-- Native normalny write nie gwarantuje receipt; `delivery_unknown` jest uczciwym statusem nawet gdy model później odpowie. Nie deklarujemy read i nie zgadujemy inReplyTo natywnej odpowiedzi.
-- Narzędzia nadal stosują uprawnienia harnessu. Zgody testowe nie oznaczają globalnego allow. Automatyczny runner bez zgody może zwrócić BLOCKED; `--approve-nab-tools` jest jawnym opt-in operatora tylko dla dwóch narzędzi w utworzonych sesjach Codexa.
-- Exact attach marker Codexa może nie zostać poprawnie odtworzony przez model; launcher wtedy nie rejestruje pozornej gotowości. Wymaga świadomego retestu, nie poluzowania gate.
-- Nie gwarantujemy przyszłych wersji CLI, fizycznej awarii nośnika ani działania w nieufnej sieci. Dostęp do sieci brokera oznacza zaufanie; brak auth NAB/RBAC zgodnie zakresem.
-- Antigravity, rzeczywiste wdrożenie między maszynami i transparentne native capture są poza MVP. Nie wszystkie kontrolne ramki Claude (np. idle subscription) są emulowane.
+Brak nowej flagi codex --name — użyj /rename lub oab-native codex rename. Pusty API-created thread bez trwałej tury może nie dawać się wznowić; nie obiecujemy takiego flow bez testu. Thread loaded nie jest dowodem widoczności w dowolnym TUI. Normalny native receipt bywa nieobecny — delivery_unknown pozostaje prawdziwym statusem.
 
-Pełny przebieg i nieudane wcześniejsze próby: acceptance-final.md, acceptance-faults.md, compatibility-matrix.md. Prywatne transkrypcje, credentials, bazy i konfiguracje nie są publikowane.
+Natywny Codex nie zapewnia globalnego zakazu wszystkich embedded/ws/stdio instancji; NAB ich nie tworzy, doctor je wykrywa. Nie zmodyfikowano binarki i nie instalowano wrappera. Sieć brokera jest zaufana, bez NAB auth/RBAC. Antigravity, fizyczny drugi host i transparentne native capture poza MVP.
+
+Szczegółowe wyniki: shared-codex-status.md. Użycie: runbook.md; cofnięcie: rollback.md. Prywatne trace/bazy/auth nie trafiają na GitHub.

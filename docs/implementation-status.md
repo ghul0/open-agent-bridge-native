@@ -1,6 +1,8 @@
 # Status implementacji NAB
 
-**Aktualny zakres: IN_PROGRESS_SHARED_CODEX.** Nadrzędna korekta w SCOPE_SHARED_CODEX.md; postęp w shared-codex-status.md. Poniższy DONE jest historycznym odbiorem wariantu per-session App Server, nie zaliczeniem nowej architektury.
+**Aktualny odbiór: DONE_LOCAL_3_SHARED_CODEX.** Release `0.2.0-52c3dc2`, runtime commit `52c3dc2`. Jeden centralny App Server, jeden NAB; natywny Codex bez wrappera i bez obowiązkowego --remote. Nowe 9/9 E2E PASS potwierdzone niezależnie, 311 testów źródłowych / 39 plików PASS, build/typecheck/lint PASS. Thread names, metadata sender, approvals, busy, reconnect i finalny smoke sprawdzone. Szczegóły w shared-codex-status.md i SCOPE_SHARED_CODEX.md.
+
+Poniższa tabela jest zachowanym historycznym odbiorem wariantu per-session. T07–T12/T14–T19/T23–T24 dla nowej architektury uzupełnia powyższy raport migracji; historycznych PASS nie przeniesiono automatycznie.
 
 **DONE_LOCAL_3 — odbiór zakończony 2026-09-08.** Obowiązuje SCOPE_LOCAL_3.md, nie historyczny LOCAL_4. Runtime release **0.1.0-9066780**, commit `9066780`. Końcowe dowody: acceptance-final.md; niepowodzenia wcześniejszych prób zachowano.
 

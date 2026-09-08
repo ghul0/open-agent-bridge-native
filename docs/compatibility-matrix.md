@@ -1,5 +1,7 @@
 # Zgodność LOCAL_3
 
+**Aktualizacja centralnego Codexa:** nowa macierz9/9 PASS na jednym codex-app-server.service, native TUI bez wrappera/--remote, metadata sender i thread.name. Release0.2.0-52c3dc2; szczegółowy nowy odbiór w shared-codex-status.md. Poniżej zachowano historyczne próby poprzedniej architektury.
+
 Data testu: 2026-09-08. Linux x86_64; Node 22.20.0. **Macierz podstawowa ma 9 potwierdzonych roundtripów** na rzeczywistych sesjach, niezależny review potwierdził ich autentyczność, a zaostrzony oracle odtworzył 9/9 PASS. Dodatkowo smoke zainstalowanego release i restart/reconnect przeszły. Końcowy automatyczny replay i niezależny odbiór zamknięto: 8 PASS oraz 1 PASS w retest po jawnej zgodzie native narzędzi testowego Claude. Szczegóły i zachowane błędy: acceptance-final.md. Status DONE_LOCAL_3.
 
 | Inicjacja | Wynik końcowej próby | Mechanizm / dowód |
