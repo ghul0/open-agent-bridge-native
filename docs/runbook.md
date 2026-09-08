@@ -1,6 +1,6 @@
 # Codzienna obsługa LOCAL_3
 
-Bieżący runtime release: **0.1.0-6f5f41a**. Instalacja lokalna została uruchomiona i przetestowana. Szczegółowy runbook z prywatnymi ścieżkami: `~/.local/state/native-agent-broker/runbook.md`. Status pełnego odbioru w implementation-status.md.
+Bieżący runtime release: **0.1.0-9066780**. Instalacja lokalna została uruchomiona i przetestowana. Szczegółowy runbook z prywatnymi ścieżkami: `~/.local/state/native-agent-broker/runbook.md`. Status pełnego odbioru w implementation-status.md.
 
 ## Start i diagnostyka
 
@@ -63,6 +63,8 @@ Release jest samowystarczalny poza checkout. Manifest ownership, hashe i backupy
 oab-native e2e --suite local-3 --tmux
 ```
 
-Oddzielny namespace, ograniczone próby i prawdziwe runtime evidence. Brak logowania, approval albo trace daje BLOCKED/NOT_RUN. Sam automatyczny runner po końcowym review nie ma jeszcze niezależnego pełnego live replay; macierz integratora została wykonana i sprawdzona osobno.
+Oddzielny namespace, ograniczone próby i prawdziwe runtime evidence. Brak logowania, approval albo trace nie daje PASS. Końcowy replay obejmuje wszystkie 9 scenariuszy, z udokumentowanym retest po zgodzie użytkownika; niezależny review potwierdził evidence.
+
+Opcje `--run-id ID --keep-sessions` pozwalają zachować własne testy do dalszej diagnostyki, a `--resume --run-id ID` wznowić tę samą przestrzeń. Użycie `--approve-nab-tools` jest jawną zgodą operatora wyłącznie na sesyjne list_agents/send_message NAB w utworzonych testowych Codexach. Nie zatwierdza innych narzędzi. Native Claude nadal wymaga własnych dozwolonych ListAgents/SendMessage; odmowa nie jest obchodzona. Po diagnostyce zamknij wyłącznie swój `tmux -L nab-e2e-ID`, nigdy domyślny serwer tmux.
 
 Drugi host: ten sam release, własny stabilny hostId i brokerUrl, kontrolowana sieć/tunel. Uruchamia tylko lokalny adapter (`oab-native host`) oraz swoje launchery; centralny broker nie korzysta z jego filesystemu. Sieć jest granicą zaufania — brak auth NAB. Nie udostępniaj App Serverów/socketów. Dwa logiczne hosty przetestowano lokalnie, nie deklarujemy dwóch rzeczywistych maszyn.

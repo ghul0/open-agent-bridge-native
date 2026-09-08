@@ -1,6 +1,6 @@
 # Zgodność LOCAL_3
 
-Data testu: 2026-09-08. Linux x86_64; Node 22.20.0. **Macierz podstawowa ma 9 potwierdzonych roundtripów** na rzeczywistych sesjach, niezależny review potwierdził ich autentyczność, a zaostrzony oracle odtworzył 9/9 PASS. Dodatkowo smoke zainstalowanego release i restart/reconnect przeszły. Pełny automatyczny odbiór pozostaje częściowy — patrz implementation-status.md.
+Data testu: 2026-09-08. Linux x86_64; Node 22.20.0. **Macierz podstawowa ma 9 potwierdzonych roundtripów** na rzeczywistych sesjach, niezależny review potwierdził ich autentyczność, a zaostrzony oracle odtworzył 9/9 PASS. Dodatkowo smoke zainstalowanego release i restart/reconnect przeszły. Końcowy automatyczny replay i niezależny odbiór zamknięto: 8 PASS oraz 1 PASS w retest po jawnej zgodzie native narzędzi testowego Claude. Szczegóły i zachowane błędy: acceptance-final.md. Status DONE_LOCAL_3.
 
 | Inicjacja | Wynik końcowej próby | Mechanizm / dowód |
 |---|---|---|

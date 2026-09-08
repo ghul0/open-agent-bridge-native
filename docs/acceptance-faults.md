@@ -18,6 +18,6 @@ Data: 2026-09-08. Wszystkie fixture używały izolowanych katalogów tymczasowyc
 
 ## Minimalne pozostałe luki
 
-- Nie wykonano destrukcyjnego crash testu kompletnego launchera Codex z realnym App Server/TUI; helper lifecycle ma deterministyczny test procesów, a live E2E pozostaje w osobnym zakresie właściciela E2E.
+- Uzupełnienie integratora: rzeczywisty test SIGTERM kompletnego launchera Codexa z App Server/TUI przeszedł — wszystkie 9 procesów jego drzewa wyszło, a sąsiednia sesja Codexa pozostała żywa. Dowód `acceptance-final/20260908local3d/real-codex-lifecycle.json`. Nie jest to gwarancja cleanup po SIGKILL launchera, którego proces nie może obsłużyć.
 - Nie symulowano fizycznej awarii urządzenia blokowego ani corruption bit-level; użyto rzeczywistego mechanizmu page exhaustion SQLite i rzeczywistych praw filesystemu.
 - Test setup używa aktualnego build drzewa projektu jako source release, nie mutuje zainstalowanego release użytkownika `0.1.0-6f5f41a`.

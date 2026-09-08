@@ -1,28 +1,29 @@
-# Raport release LOCAL_3
+# Raport końcowy LOCAL_3
 
-Status: **PARTIAL_LOCAL_3_RUNNING**. Wdrożono runtime release **0.1.0-6f5f41a**, obie usługi systemd użytkownika są active/enabled. Trzy launchery z nowych powłok i rzeczywiste roundtrips release przeszły; restart usług i reconnect potwierdzone. Nie oznaczono pełnego DONE_LOCAL_3: T16/T19/T24 mają jawne braki odtworzenia, opisane w implementation-status.md.
+**DONE_LOCAL_3.** Odbiór zakończony 2026-09-08. Wdrożony runtime commit **9066780**, release **0.1.0-9066780**. Repozytorium: https://github.com/ghul0/open-agent-bridge-native; PR: https://github.com/ghul0/open-agent-bridge-native/pull/1.
 
-## Zrealizowane i zweryfikowane
+## Wynik
 
-- Właściwy fork, pinned upstream, zachowane MIT notices; TypeScript, istniejący RegistryServer i ChannelStore SQLite.
-- Native projekcje Claude, Codex managed App Server + ten sam TUI/thread, czyste Pi 0.85.1; dwa narzędzia dla Codexa/Pi.
-- 9 rzeczywistych roundtripów podstawowej macierzy potwierdzono niezależnym review i zaostrzonym oracle z właściwymi aliasami. Wcześniejsze nieudane próby zachowano, szczegóły w compatibility-matrix.md.
-- Busy Codex: turn/steer z expectedTurnId, ta sama sesja/turn, read challenge i jawny MCP reply. Busy Pi: peer input przez steer, odczyt challenge i jawny reply. Wieloturowa pamięć Pi potwierdzona w tym samym sessionId.
-- Native hold/refuse potwierdzone na własnych profilach bez uruchomienia modelu; brak globalnych zmian uprawnień. Poprawiono obsługę końcowego receipt po held i dodano regresję.
-- Broker/host restart z zachowaniem historii i reconnect realnych Pi/Codexa, kolejne odpowiedzi dotarły do Claude.
-- Dwa logiczne hosty, wiele adapterów jednego hosta, FIFO/TTL/unknown, idempotencja, konflikty ID, rate limit i WAL-safe backup zweryfikowane testami bez LLM.
-- Full build/lint exit 0; ostatni pełny test suite **542 PASS / 62 pliki** (runner uwzględnia źródła i skompilowane testy, nie 542 unikalne scenariusze biznesowe).
-- Installer przechodzi 9 testów, rzeczywisty candidate kopiowany bez .git, konfiguracji użytkownika i wyjścia symlinków poza release; CLI help i systemd-analyze verify PASS w izolowanym HOME.
+- Jeden istniejący RegistryServer i ChannelStore SQLite rozbudowany o native profile, trwały outbox, statusy, kolejkę, TTL, idempotencję i routing do przypisanego adaptera.
+- Claude używa prawdziwych ListAgents/SendMessage; Codex ma kontrolowany App Server i ten sam widoczny TUI/thread; Pi 0.85.1 działa jako czysta izolowana instalacja z extension.
+- **9/9 scenariuszy live PASS**: sześć cross-harness, Codex↔Codex, Pi↔Pi i kontrola native Claude↔Claude. Automatyczny replay zakończył 8 scenariuszy; jeden blokowany przez native classifier powtórzono po jawnej zgodzie użytkownika w tej samej sesji. Wszystkie końcowe próby przeszły rygorystyczny oracle i niezależny review.
+- Busy Codex `turn/steer` z expectedTurnId = turnId, busy Pi, odczyt nieznanego challenge oraz rzeczywiste odpowiedzi. Dodatkowo trzy wymiany pamięci 29 → 88 → recall na tym samym Pi sessionId.
+- Rzeczywisty shutdown testowego Codexa zamknął wszystkie jego procesy, a sąsiedni Codex pozostał aktywny. Po zakończeniu odbioru zamknięto wyłącznie własny namespace testowy i sprawdzono brak orphanów.
+- **283 unikalne testy źródłowe / 33 pliki PASS**; build, typecheck i lint PASS. Skopiowane testy dist nie są ponownie liczone.
+- Realne SQLITE_FULL, readonly permissions, brak DB z markerem, przerwany/obcy ACK, replay/lease/FIFO/TTL/rate-limit oraz odtworzenie backupu. Dwa logiczne hosty testowane lokalnie.
 
-## Jawne ograniczenia
+## Wdrożenie
 
-- Native normal delivery nie daje potwierdzonego receipt w testowanym torze. Ledger może pokazywać delivery_unknown mimo późniejszego realnego odbioru. Nie zgadujemy inReplyTo dla natywnej odpowiedzi Claude.
-- Nowy Codex wymaga początkowego modelowego markera attach; zajmuje jedną krótką turę. Start samej usługi nie uruchamia modeli.
-- MCP ma normalne zgody harnessu. W testach użytkownik jawnie dopuścił tylko list_agents/send_message dla sesji testowych. Nie stosować tej zgody do dowolnych operacji.
-- Automatyczny runner E2E wymaga dostępnego auth, zaakceptowania wymaganych promptów i strukturalnych transcriptów. Nieobecny dowód daje NOT_RUN, nie PASS. Pełna macierz była wykonana przez integratora na rzeczywistych sesjach; samo polecenie runnera nie zostało jeszcze odtworzone od zera po wszystkich poprawkach.
-- Ostatni dodatkowy prompt retestu Codex→Pi został przez model skrócony do samego TEST nonce; odpowiedź nie stanowi retestu challenge i pozostaje poza PASS. Pierwotna macierz ma oddzielny poprawny scenariusz z challenge.
-- Antigravity, physical distributed deployment i native capture poza MVP. Brak pełnego wsparcia wszystkich kontrolnych operacji peer protocol (np. notify_when_idle projekcji).
+Dwie usługi `nab-broker.service` i `nab-host.service` są **active/enabled** w systemd --user. Broker nasłuchuje na loopback, `doctor --json` kończy się sukcesem. Release leży poza checkout. Po aktualizacji usług rzeczywiste sesje odzyskały połączenie, a Codex i Pi odpowiedziały na nowe wyzwanie przez native Claude. Backup VACUUM INTO wykonano na działającej bazie.
 
-## Publikacja
+Pozostawiono trzy bezczynne demonstracje w prywatnym tmux `nab-local3`, okna `demo-claude`, `demo-codex`, `demo-pi`. Nie pozostawiono pętli agentów. Lokalny runbook i manifesty są poza repo; wersja publiczna w runbook.md / rollback.md.
 
-Repo: https://github.com/ghul0/open-agent-bridge-native, gałąź feat/native-agent-messaging. Prywatne dowody w katalogu stanu użytkownika; nie wysyłane na GitHub. PR ma pozostać draft do zamknięcia końcowego odbioru.
+## Zachowane ograniczenia
+
+- Native normalny write nie gwarantuje receipt; `delivery_unknown` jest uczciwym statusem nawet gdy model później odpowie. Nie deklarujemy read i nie zgadujemy inReplyTo natywnej odpowiedzi.
+- Narzędzia nadal stosują uprawnienia harnessu. Zgody testowe nie oznaczają globalnego allow. Automatyczny runner bez zgody może zwrócić BLOCKED; `--approve-nab-tools` jest jawnym opt-in operatora tylko dla dwóch narzędzi w utworzonych sesjach Codexa.
+- Exact attach marker Codexa może nie zostać poprawnie odtworzony przez model; launcher wtedy nie rejestruje pozornej gotowości. Wymaga świadomego retestu, nie poluzowania gate.
+- Nie gwarantujemy przyszłych wersji CLI, fizycznej awarii nośnika ani działania w nieufnej sieci. Dostęp do sieci brokera oznacza zaufanie; brak auth NAB/RBAC zgodnie zakresem.
+- Antigravity, rzeczywiste wdrożenie między maszynami i transparentne native capture są poza MVP. Nie wszystkie kontrolne ramki Claude (np. idle subscription) są emulowane.
+
+Pełny przebieg i nieudane wcześniejsze próby: acceptance-final.md, acceptance-faults.md, compatibility-matrix.md. Prywatne transkrypcje, credentials, bazy i konfiguracje nie są publikowane.
