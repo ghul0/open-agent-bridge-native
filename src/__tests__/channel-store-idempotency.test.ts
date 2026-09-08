@@ -11,7 +11,7 @@ import { ChannelStore } from "../registry/channel-store.js";
  * - Without an explicit messageId, every call creates a new row.
  * - The expired-awaiting-reply scanner picks the right messages for the sweeper.
  */
-describe("ChannelStore — self-heal on readonly DB", () => {
+describe("ChannelStore — fail closed on readonly DB", () => {
   let tmpDir: string;
   let store: ChannelStore;
 
@@ -24,24 +24,22 @@ describe("ChannelStore — self-heal on readonly DB", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("reopens and retries when a write hits 'attempt to write a readonly database'", () => {
+  it("surfaces readonly errors without reopening or pretending to recover history", () => {
     store.createMessage({ conversationId: "c1", messageId: "m1", fromAgentId: "a", content: "hi", kind: "chat" });
 
-    // Simulate the incident (registry.sqlite deleted under the daemon → SQLITE_READONLY):
-    // query_only makes every write on THIS handle raise the same error, and a
-    // reopen clears it — exactly the recovery path writable() must take.
+    // A readonly handle must surface the error, never silently reopen storage.
     // biome-ignore lint/suspicious/noExplicitAny: reach the private handle to break it
     (store as any).db.exec("PRAGMA query_only = ON");
 
-    const result = store.createMessage({
+    expect(() => store.createMessage({
       conversationId: "c2",
       messageId: "m2",
       fromAgentId: "a",
-      content: "after heal",
+      content: "after failure",
       kind: "chat",
-    });
-    expect(result.created).toBe(true);
-    expect(store.getMessage("m2")?.content).toBe("after heal");
+    })).toThrow(/readonly/i);
+    expect(store.getMessage("m2")).toBeUndefined();
+    expect(store.getMessage("m1")?.content).toBe("hi");
   });
 
   it("rethrows non-readonly write errors untouched", () => {

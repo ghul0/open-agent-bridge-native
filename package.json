@@ -5,7 +5,8 @@
   "type": "module",
   "bin": {
     "open-agent-bridge": "./dist/cli/index.js",
-    "oab": "./dist/cli/index.js"
+    "oab": "./dist/cli/index.js",
+    "oab-native": "./dist/native/cli.js"
   },
   "files": [
     "dist",

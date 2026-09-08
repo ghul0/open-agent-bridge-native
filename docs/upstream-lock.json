@@ -1,0 +1,8 @@
+{
+  "readAt": "2026-09-08",
+  "upstream": {"url": "https://github.com/kevinArgueta96/open-agent-bridge", "branch": "production", "sha": "391f605b65b7b85128621c1c7be55178cea59390", "license": "MIT"},
+  "reference": {"url": "https://github.com/alonw0/pi-claude-link", "branch": "main", "sha": "7fdccbdffd556f7e76b6a35a8bb545c89c76133a", "license": "MIT"},
+  "baseline": {"node": "22.20.0", "pnpm": "11.22.0", "sqlite": "3.50.4", "build": "PASS", "tests": {"passed": 376, "files": 48}, "lint": "PASS_WITH_WARNINGS", "install": "frozen-lockfile, ignore-scripts"},
+  "harnesses": {"claude": "2.1.263", "codex": "0.153.4", "pi": "clean install pending"},
+  "schemaFingerprint": null
+}

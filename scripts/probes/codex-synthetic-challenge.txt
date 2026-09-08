@@ -1,0 +1,5 @@
+Synthetic NAB Codex probe fixture.
+Nonce: NAB-CODEX-01534-7F2C
+Idle challenge: reply exactly IDLE-NAB-CODEX-01534-7F2C.
+Busy steering challenge: when steered, reply exactly STEER-NAB-CODEX-01534-7F2C.
+This file contains no secret or user data.

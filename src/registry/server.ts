@@ -3,6 +3,10 @@ import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import express from "express";
+import {
+  NativeClientFrameSchema, NativeError, NativeSendSchema, nativeAgentId,
+  type NativeEndpoint, type NativeClientFrame, type NativeMessage, type NativeServerFrame,
+} from "../native/contracts.js";
 import { WebSocketServer, WebSocket } from "ws";
 import { AgentStore } from "./store.js";
 import { RegistryEventBus } from "./events.js";
@@ -43,7 +47,11 @@ const dashboardDir =
 export class RegistryServer {
   private eventBus = new RegistryEventBus();
   private store = new AgentStore(this.eventBus);
-  private channelStore = new ChannelStore();
+  private channelStore: ChannelStore;
+  private wss?: WebSocketServer;
+  private nativeTimer?: NodeJS.Timeout;
+  private nativeHosts = new Map<string, { ws: WebSocket; instanceId: string; hostId: string; adapterId: string; lastSeen: number }>();
+  private nativeBindings = new Map<WebSocket, string>();
   private app = express();
   private httpServer: ReturnType<typeof createServer> | null = null;
   private healthCheckTimer: NodeJS.Timeout | null = null;
@@ -53,12 +61,205 @@ export class RegistryServer {
   private wsClients = new Set<WebSocket>();
   private agentWsMap = new Map<string, WebSocket>();
 
-  constructor(private readonly port = REGISTRY_PORT) {
+  constructor(
+    private readonly port = REGISTRY_PORT,
+    private readonly options: { native?: boolean; dbPath?: string; host?: string } = {},
+  ) {
+    this.channelStore = new ChannelStore(options.dbPath);
+    if (options.native) {
+      this.channelStore.interruptNative();
+      this.channelStore.saveNativeEndpoints(this.channelStore.nativeEndpoints().map((agent) => ({ ...agent, reachable: false })));
+    }
     this.setupRoutes();
   }
 
+  get address(): string {
+    const address = this.httpServer?.address();
+    if (!address || typeof address === "string") throw new Error("Registry is not listening");
+    return `http://${address.family === "IPv6" ? `[${address.address}]` : address.address}:${address.port}`;
+  }
+
+  private nativeSend(ws: WebSocket, frame: NativeServerFrame): void {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
+  }
+
+  private nativeRoster(): void {
+    const agents = this.channelStore.nativeEndpoints();
+    for (const ws of this.wsClients) this.nativeSend(ws, { type: "native.roster", agents });
+  }
+
+  private disconnectNative(ws: WebSocket): void {
+    const hostId = this.nativeBindings.get(ws);
+    this.nativeBindings.delete(ws);
+    if (!hostId || this.nativeHosts.get(hostId)?.ws !== ws) return;
+    this.nativeHosts.delete(hostId);
+    const endpoints = this.channelStore.nativeEndpoints().filter((agent) => this.channelStore.nativeAdapterKey(agent.agentId) === hostId);
+    this.channelStore.interruptNative(endpoints.map((agent) => agent.agentId));
+    this.channelStore.saveNativeEndpoints(endpoints.map((agent) => ({ ...agent, reachable: false })));
+    this.nativeRoster();
+  }
+
+  private nativeFrame(ws: WebSocket, frame: NativeClientFrame): void {
+    this.channelStore.assertHealthy();
+    if (frame.type === "native.register") {
+      const adapterId = frame.adapterId ?? frame.hostId;
+      const adapterKey = JSON.stringify([frame.hostId, adapterId]);
+      const bound = this.nativeBindings.get(ws);
+      if (bound && bound !== adapterKey) throw new NativeError(409, "Connection is already bound to another host");
+      const ids = new Set<string>();
+      for (const agent of frame.endpoints) {
+        if (agent.hostId !== frame.hostId || agent.instanceId !== frame.instanceId ||
+          agent.agentId !== nativeAgentId(agent.hostId, agent.harness, agent.nativeSessionId) || ids.has(agent.agentId)) {
+          throw new NativeError(400, "Invalid endpoint identity or duplicate endpoint");
+        }
+        const owner = this.channelStore.nativeAdapterKey(agent.agentId);
+        if (owner && owner !== adapterKey) throw new NativeError(409, "Endpoint belongs to another adapter");
+        ids.add(agent.agentId);
+      }
+      const previous = this.nativeHosts.get(adapterKey);
+      const old = this.channelStore.nativeEndpoints().filter((agent) => this.channelStore.nativeAdapterKey(agent.agentId) === adapterKey);
+      if (previous && (previous.ws !== ws || previous.instanceId !== frame.instanceId)) {
+        this.channelStore.interruptNative(old.map((agent) => agent.agentId));
+        if (previous.ws !== ws) {
+          this.nativeBindings.delete(previous.ws);
+          previous.ws.close(4001, "Superseded by snapshot reconnect");
+        }
+      }
+      const removed = old.filter((agent) => !ids.has(agent.agentId));
+      this.channelStore.interruptNative(removed.map((agent) => agent.agentId));
+      this.channelStore.saveNativeEndpoints([
+        ...removed.map((agent) => ({ ...agent, reachable: false })), ...frame.endpoints,
+      ], adapterKey);
+      this.nativeHosts.set(adapterKey, { ws, instanceId: frame.instanceId, hostId: frame.hostId, adapterId, lastSeen: Date.now() });
+      this.nativeBindings.set(ws, adapterKey);
+      this.nativeRoster();
+      this.dispatchNative();
+      return;
+    }
+    const hostId = this.nativeBindings.get(ws);
+    const host = hostId ? this.nativeHosts.get(hostId) : undefined;
+    if (!host || host.ws !== ws) throw new NativeError(409, "Register a host snapshot first");
+    if (Date.now() - host.lastSeen >= 60_000) {
+      this.nativeDisconnectSafely(ws);
+      throw new NativeError(409, "Adapter lease expired; register a fresh connection");
+    }
+    if (frame.type === "native.heartbeat") {
+      if (frame.hostId !== host.hostId || (frame.adapterId ?? frame.hostId) !== host.adapterId) throw new NativeError(409, "Heartbeat host does not match connection");
+      this.nativeSend(ws, { type: "native.roster", agents: this.channelStore.nativeEndpoints() });
+    } else {
+      const message = this.channelStore.nativeMessage(frame.messageId);
+      const recipient = this.channelStore.nativeEndpoints().find((agent) => agent.agentId === message?.toAgentId);
+      if (!recipient || this.channelStore.nativeAdapterKey(recipient.agentId) !== hostId) throw new NativeError(409, "Receipt recipient is not on this host");
+      this.channelStore.receiptNative(frame.messageId, host.instanceId, frame.state, frame.detail);
+    }
+    host.lastSeen = Date.now();
+    this.dispatchNative();
+  }
+
+  private canDispatchNative(agent: NativeEndpoint, message: Pick<NativeMessage, "deliveryPolicy">): boolean {
+    const host = this.nativeHosts.get(this.channelStore.nativeAdapterKey(agent.agentId) ?? "");
+    if (!agent.reachable || !host || host.ws.readyState !== WebSocket.OPEN || Date.now() - host.lastSeen >= 60_000) return false;
+    if (agent.state === "idle") return agent.capabilities.receiveIdle;
+    return agent.state === "active" && message.deliveryPolicy !== "queue" && agent.capabilities.receiveBusy === "steer";
+  }
+
+  private dispatchNative(): void {
+    // Every dispatch path (HTTP, WS and timer) expires leases before considering queued work.
+    for (const host of this.nativeHosts.values()) {
+      if (Date.now() - host.lastSeen >= 60_000) this.nativeDisconnectSafely(host.ws);
+    }
+    this.channelStore.maintainNative();
+    const agents = new Map(this.channelStore.nativeEndpoints().map((agent) => [agent.agentId, agent]));
+    const messages = this.channelStore.nativeMessages();
+    const blocked = new Set(messages.filter((message) => message.state === "accepted" || message.state === "held").map((message) => message.toAgentId));
+    for (const message of messages) {
+      if (message.state !== "queued" || blocked.has(message.toAgentId)) continue;
+      blocked.add(message.toAgentId); // FIFO head blocks later messages even if its policy cannot dispatch.
+      const agent = agents.get(message.toAgentId);
+      if (!agent || !this.canDispatchNative(agent, message)) continue;
+      const host = this.nativeHosts.get(this.channelStore.nativeAdapterKey(agent.agentId) ?? "");
+      if (!host) continue;
+      const attempted = this.channelStore.attemptNative(message.messageId, host.instanceId);
+      if (!attempted) continue;
+      try {
+        host.ws.send(JSON.stringify({ type: "native.deliver", message: attempted }), (error) => {
+          if (error) this.nativeDisconnectSafely(host.ws);
+        });
+      } catch {
+        this.disconnectNative(host.ws);
+      }
+    }
+  }
+
+  private nativeDisconnectSafely(ws: WebSocket): void {
+    try { this.disconnectNative(ws); } catch { /* Storage failure stays visible via HTTP health; never resend. */ }
+    ws.terminate();
+  }
+
+  private setupNativeRoutes(): void {
+    this.app.get("/native/health", (_req, res) => {
+      this.channelStore.assertHealthy();
+      res.json({ status: "ok", profile: "native", hosts: this.nativeHosts.size });
+    });
+    this.app.get("/native/agents", (req, res) => {
+      const query = typeof req.query.query === "string" ? req.query.query.toLowerCase() : "";
+      const agents = this.channelStore.nativeEndpoints().filter((agent) =>
+        (req.query.include_offline === "true" || agent.reachable) &&
+        (!req.query.harness || req.query.harness === agent.harness) &&
+        (!query || agent.displayName.toLowerCase().includes(query) || agent.agentId.toLowerCase().includes(query)));
+      res.json({ agents });
+    });
+    this.app.get("/native/messages", (req, res) => {
+      this.channelStore.maintainNative();
+      res.json({ messages: this.channelStore.nativeMessages().filter((message) => !req.query.agent || message.fromAgentId === req.query.agent || message.toAgentId === req.query.agent).map((message) => {
+        if (req.query.include_body === "true") return message;
+        const { text: _text, ...metadata } = message;
+        return metadata;
+      }) });
+    });
+    this.app.post("/native/messages", (req, res) => {
+      const parsed = NativeSendSchema.safeParse(req.body);
+      if (!parsed.success) throw new NativeError(400, "Invalid native message payload");
+      const endpoints = this.channelStore.nativeEndpoints();
+      const sender = endpoints.find((agent) => agent.agentId === req.get("x-nab-agent-id"));
+      if (!sender) throw new NativeError(400, "A registered sender binding is required");
+      this.channelStore.maintainNative();
+      const result = this.channelStore.acceptNative(sender, parsed.data, () => {
+        const matches = endpoints.filter((agent) => agent.agentId === parsed.data.to);
+        const candidates = matches.length ? matches : endpoints.filter((agent) => agent.displayName === parsed.data.to);
+        const recipient = candidates[0];
+        if (candidates.length !== 1 || !recipient) throw new NativeError(candidates.length ? 409 : 404, "Recipient is missing or ambiguous");
+        const available = recipient.reachable && this.nativeHosts.get(this.channelStore.nativeAdapterKey(recipient.agentId) ?? "")?.ws.readyState === WebSocket.OPEN;
+        if (!available && parsed.data.delivery !== "queue") throw new NativeError(409, "Recipient offline; use explicit queue policy");
+        if (available && parsed.data.delivery === "steer" && !this.canDispatchNative(recipient, { deliveryPolicy: "steer" })) {
+          throw new NativeError(409, "Recipient cannot accept steering in its current state");
+        }
+        if (available && parsed.data.delivery === "auto" && recipient.state === "active" && recipient.capabilities.receiveBusy === "unsupported") {
+          throw new NativeError(409, "Recipient does not support busy delivery; use explicit queue policy");
+        }
+        return recipient;
+      });
+      this.dispatchNative();
+      const message = this.channelStore.nativeMessage(result.message.messageId);
+      if (!message) throw new Error("Accepted message disappeared from storage");
+      const { text: _text, ...metadata } = message;
+      res.status(result.created ? 201 : 200).json({ ...metadata, deduplicated: !result.created });
+    });
+    // No legacy mutation, history, event broadcast or relay in the native profile.
+    this.app.use((_req, res) => { res.status(404).json({ error: "Route unavailable in native profile" }); });
+    this.app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      const status = error instanceof NativeError ? error.status :
+        error instanceof SyntaxError ? 400 : 503;
+      res.status(status).json({ error: error instanceof NativeError ? error.message : status === 400 ? "Invalid JSON" : "Storage unavailable" });
+    });
+  }
+
   private setupRoutes(): void {
-    this.app.use(express.json());
+    this.app.use(express.json({ limit: "512kb" }));
+    if (this.options.native) {
+      this.setupNativeRoutes();
+      return;
+    }
 
     // CORS headers for browser access
     this.app.use((_req, res, next) => {
@@ -485,7 +686,8 @@ export class RegistryServer {
     this.httpServer = createServer(this.app);
 
     // WebSocket server on /ws path
-    const wss = new WebSocketServer({ server: this.httpServer, path: "/ws" });
+    const wss = new WebSocketServer({ server: this.httpServer, path: "/ws", maxPayload: 1024 * 1024 });
+    this.wss = wss;
 
     // WebSocket keepalive: ping every 15s, terminate if no pong within 15s.
     // Worst-case zombie window is ~30s (one missed cycle + the next), versus
@@ -518,6 +720,25 @@ export class RegistryServer {
       (ws as any)._isAlive = true;
       ws.on("pong", () => { (ws as any)._isAlive = true; });
       this.wsClients.add(ws);
+      if (this.options.native) {
+        try { this.nativeSend(ws, { type: "native.roster", agents: this.channelStore.nativeEndpoints() }); }
+        catch { this.nativeSend(ws, { type: "native.error", error: "Storage unavailable" }); }
+        ws.on("message", (raw) => {
+          try {
+            const parsed = NativeClientFrameSchema.safeParse(JSON.parse(raw.toString()));
+            if (!parsed.success) throw new NativeError(400, "Invalid native frame");
+            this.nativeFrame(ws, parsed.data);
+          } catch (error) {
+            this.nativeSend(ws, { type: "native.error", error: error instanceof NativeError ? error.message : "Native request failed" });
+          }
+        });
+        ws.on("close", () => {
+          this.wsClients.delete(ws);
+          this.nativeDisconnectSafely(ws);
+        });
+        ws.on("error", () => this.nativeDisconnectSafely(ws));
+        return;
+      }
       let identifiedAgentId: string | null = null;
 
       // Send snapshot of current agents
@@ -660,11 +881,20 @@ export class RegistryServer {
         }
       };
       this.httpServer!.once("error", onError);
-      this.httpServer!.listen(this.port, "localhost", () => {
+      this.httpServer!.listen(this.port, this.options.host ?? "127.0.0.1", () => {
         this.httpServer!.removeListener("error", onError);
         resolve();
       });
     });
+
+    if (this.options.native) {
+      this.nativeTimer = setInterval(() => {
+        try {
+          this.dispatchNative();
+        } catch { /* HTTP returns an explicit storage error; do not recreate storage. */ }
+      }, 1000);
+      return;
+    }
 
     this.healthCheckTimer = setInterval(() => {
       this.store.healthCheck();
@@ -769,6 +999,15 @@ export class RegistryServer {
   }
 
   async stop(): Promise<void> {
+    if (this.nativeTimer) clearInterval(this.nativeTimer);
+    if (this.options.native) {
+      try {
+        this.channelStore.interruptNative();
+        this.channelStore.saveNativeEndpoints(this.channelStore.nativeEndpoints().map((agent) => ({ ...agent, reachable: false })));
+      } catch { /* Preserve storage failure; stop must still close resources. */ }
+      this.nativeHosts.clear();
+      this.nativeBindings.clear();
+    }
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
     }
@@ -788,8 +1027,12 @@ export class RegistryServer {
     }
     this.wsClients.clear();
 
-    await new Promise<void>((resolve, reject) => {
-      this.httpServer?.close((err) => (err ? reject(err) : resolve()));
-    });
+    this.wss?.close();
+    if (this.httpServer?.listening) {
+      await new Promise<void>((resolve, reject) => {
+        this.httpServer!.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+    this.channelStore.close();
   }
 }

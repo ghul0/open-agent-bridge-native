@@ -1,4 +1,11 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  NativeError,
+  type NativeEndpoint,
+  type NativeMessage,
+  type NativeMessageState,
+  type NativeSend,
+} from "../native/contracts.js";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -20,10 +27,58 @@ function defaultDbPath(): string {
 export class ChannelStore {
   private db: DatabaseSync;
   private readonly dbPath: string;
+  private identity?: { dev: number; ino: number };
+  private storageLost = false;
 
   constructor(dbPath = defaultDbPath()) {
     this.dbPath = dbPath;
+    if (dbPath !== ":memory:" && existsSync(`${dbPath}.initialized`) && !existsSync(dbPath)) {
+      throw new Error("Storage lost; restore history before restarting");
+    }
     this.db = this.open();
+    if (dbPath !== ":memory:") {
+      this.identity = statSync(dbPath);
+      // A durable sentinel prevents restart from treating a deleted ledger as first boot.
+      if (!existsSync(`${dbPath}.initialized`)) writeFileSync(`${dbPath}.initialized`, "ChannelStore initialized\n", { flag: "wx", mode: 0o600 });
+    }
+  }
+
+  assertHealthy(): void {
+    if (this.identity) {
+      try {
+        const current = statSync(this.dbPath);
+        if (current.dev !== this.identity.dev || current.ino !== this.identity.ino) this.storageLost = true;
+      } catch {
+        this.storageLost = true;
+      }
+    }
+    if (this.storageLost) throw new Error("Storage lost or replaced; restore history before restarting");
+    this.db.prepare("SELECT 1").get();
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  /** Consistent SQLite snapshot, including committed WAL data. Never overwrite a backup. */
+  backup(destination: string): { dbPath: string; markerPath: string } {
+    this.assertHealthy();
+    const dbPath = resolve(destination), markerPath = `${dbPath}.initialized`;
+    if ([dbPath, markerPath, `${dbPath}-wal`, `${dbPath}-shm`].some(existsSync)) {
+      throw new Error("Backup destination already exists");
+    }
+    mkdirSync(dirname(dbPath), { recursive: true, mode: 0o700 });
+    // Reserve a private empty file; VACUUM INTO accepts an empty destination.
+    writeFileSync(dbPath, "", { flag: "wx", mode: 0o600 });
+    try {
+      this.db.prepare("VACUUM INTO ?").run(dbPath);
+      this.assertHealthy();
+      writeFileSync(markerPath, "ChannelStore initialized\n", { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      unlinkSync(dbPath);
+      throw error;
+    }
+    return { dbPath, markerPath };
   }
 
   private open(): DatabaseSync {
@@ -59,46 +114,192 @@ export class ChannelStore {
         suppressed_at INTEGER NOT NULL
       );
     `);
+    // Add native metadata to the existing ledger, not a parallel message store.
+    const columns = db.prepare("PRAGMA table_info(channel_messages)").all() as Array<{ name: string }>;
+    for (const [name, type] of Object.entries({
+      profile: "TEXT NOT NULL DEFAULT 'legacy'", sender_id: "TEXT", recipient_id: "TEXT",
+      idempotency_key: "TEXT", request_json: "TEXT", native_state: "TEXT", expires_at: "INTEGER",
+      attempted_at: "INTEGER", attempt_instance: "TEXT",
+    })) {
+      if (!columns.some((column) => column.name === name)) db.exec(`ALTER TABLE channel_messages ADD COLUMN ${name} ${type}`);
+    }
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_native_idempotency
+        ON channel_messages(sender_id, idempotency_key) WHERE profile = 'native';
+      CREATE INDEX IF NOT EXISTS idx_native_queue ON channel_messages(recipient_id, native_state);
+      CREATE INDEX IF NOT EXISTS idx_native_pair_rate ON channel_messages(sender_id, recipient_id, created_at) WHERE profile = 'native';
+      CREATE TABLE IF NOT EXISTS channel_endpoints (agent_id TEXT PRIMARY KEY, payload_json TEXT NOT NULL);
+    `);
+    const endpointColumns = db.prepare("PRAGMA table_info(channel_endpoints)").all() as Array<{ name: string }>;
+    if (!endpointColumns.some((column) => column.name === "adapter_key")) db.exec("ALTER TABLE channel_endpoints ADD COLUMN adapter_key TEXT");
     return db;
   }
 
-  /** Run a write, self-healing when the DB file was deleted/moved under the
-   *  running daemon (SQLite reports "attempt to write a readonly database").
-   *  Reopening recreates the file + schema and retries once; the prior history
-   *  is already gone with the deleted inode, but the registry keeps serving
-   *  instead of 500ing on every send until a manual restart. */
+  /** Never reopen an empty replacement over lost history. */
   private writable<T>(fn: () => T): T {
-    try {
-      return fn();
-    } catch (err) {
-      if (!/readonly database/i.test(String(err))) throw err;
-      console.error(`[ChannelStore] DB at ${this.dbPath} became readonly (deleted under us?) — reopening`);
-      // Open the replacement BEFORE discarding the old handle: if reopen fails
-      // we keep the previous (still readable) handle and surface the original
-      // write error, instead of bricking reads too.
-      let next: DatabaseSync;
+    this.assertHealthy();
+    return fn();
+  }
+
+  private transaction<T>(fn: () => T): T {
+    return this.writable(() => {
+      this.db.exec("BEGIN IMMEDIATE");
       try {
-        next = this.open();
-      } catch (reopenErr) {
-        console.error(`[ChannelStore] reopen failed, keeping old handle: ${String(reopenErr)}`);
-        throw err;
+        const result = fn();
+        this.db.exec("COMMIT");
+        return result;
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
       }
-      try {
-        this.db.close();
-      } catch {
-        // Old handle already unusable.
+    });
+  }
+
+  nativeEndpoints(): NativeEndpoint[] {
+    this.assertHealthy();
+    return (this.db.prepare("SELECT payload_json FROM channel_endpoints ORDER BY agent_id").all() as Array<{ payload_json: string }>)
+      .map((row) => JSON.parse(row.payload_json) as NativeEndpoint);
+  }
+
+  nativeAdapterKey(agentId: string): string | undefined {
+    this.assertHealthy();
+    const row = this.db.prepare("SELECT adapter_key FROM channel_endpoints WHERE agent_id = ?").get(agentId) as { adapter_key: string | null } | undefined;
+    return row?.adapter_key ?? undefined;
+  }
+
+  saveNativeEndpoints(endpoints: NativeEndpoint[], adapterKey?: string): void {
+    this.transaction(() => {
+      const insert = this.db.prepare(`INSERT INTO channel_endpoints (agent_id, payload_json, adapter_key) VALUES (?, ?, ?)
+        ON CONFLICT(agent_id) DO UPDATE SET payload_json = excluded.payload_json, adapter_key = COALESCE(excluded.adapter_key, channel_endpoints.adapter_key)`);
+      for (const endpoint of endpoints) insert.run(endpoint.agentId, JSON.stringify(endpoint), adapterKey ?? null);
+    });
+  }
+
+  nativeMessages(): NativeMessage[] {
+    this.assertHealthy();
+    return (this.db.prepare("SELECT payload_json FROM channel_messages WHERE profile = 'native' ORDER BY rowid").all() as Array<{ payload_json: string }>)
+      .map((row) => JSON.parse(row.payload_json) as NativeMessage);
+  }
+
+  nativeMessage(messageId: string): NativeMessage | undefined {
+    this.assertHealthy();
+    const row = this.db.prepare("SELECT payload_json FROM channel_messages WHERE profile = 'native' AND message_id = ?").get(messageId) as { payload_json: string } | undefined;
+    return row ? JSON.parse(row.payload_json) as NativeMessage : undefined;
+  }
+
+  private updateNative(message: NativeMessage): void {
+    this.db.prepare(`UPDATE channel_messages SET payload_json = ?, native_state = ?, attempted_at = ? WHERE message_id = ?`)
+      .run(JSON.stringify(message), message.state, message.attemptedAt ?? null, message.messageId);
+    this.db.prepare("INSERT INTO channel_acks VALUES (?, ?, ?, ?, ?)")
+      .run(randomUUID(), message.conversationId, message.messageId, Date.now(), JSON.stringify({ state: message.state, detail: message.detail }));
+  }
+
+  acceptNative(sender: NativeEndpoint, input: NativeSend, resolveRecipient: () => NativeEndpoint, now = Date.now()): { message: NativeMessage; created: boolean } {
+    return this.transaction(() => {
+      const request = JSON.stringify(input);
+      if (input.idempotency_key) {
+        const row = this.db.prepare("SELECT payload_json, request_json FROM channel_messages WHERE profile = 'native' AND sender_id = ? AND idempotency_key = ?")
+          .get(sender.agentId, input.idempotency_key) as { payload_json: string; request_json: string } | undefined;
+        if (row) {
+          if (row.request_json !== request) throw new NativeError(409, "Idempotency key conflicts with the original payload");
+          return { message: JSON.parse(row.payload_json) as NativeMessage, created: false };
+        }
       }
-      this.db = next;
-      return fn();
-    }
+      const recipient = resolveRecipient();
+      // Reuse the retained ledger instead of maintaining an unbounded per-pair map.
+      // The transaction makes this sliding-window limit atomic and restart-safe.
+      const recent = this.db.prepare(`SELECT COUNT(*) AS count FROM channel_messages
+        WHERE profile = 'native' AND sender_id = ? AND recipient_id = ? AND created_at > ?`)
+        .get(sender.agentId, recipient.agentId, now - 60_000) as { count: number };
+      if (recent.count >= 30) throw new NativeError(429, "Pair rate limit exceeded (30 new messages per 60 seconds)");
+      const count = this.db.prepare("SELECT COUNT(*) AS count FROM channel_messages WHERE profile = 'native' AND recipient_id = ? AND native_state IN ('accepted', 'queued')")
+        .get(recipient.agentId) as { count: number };
+      if (count.count >= 100) throw new NativeError(429, "Recipient queue is full (100 messages)");
+      let reply: NativeMessage | undefined;
+      if (input.in_reply_to) {
+        reply = this.nativeMessage(input.in_reply_to);
+        if (!reply || reply.toAgentId !== sender.agentId || reply.fromAgentId !== recipient.agentId ||
+          (input.conversation_id && input.conversation_id !== reply.conversationId)) {
+          throw new NativeError(400, "Reply does not match the original participants and conversation");
+        }
+      }
+      const message: NativeMessage = {
+        messageId: randomUUID(), conversationId: input.conversation_id ?? reply?.conversationId ?? randomUUID(),
+        fromAgentId: sender.agentId, toAgentId: recipient.agentId, sourceInstanceId: sender.instanceId,
+        text: input.text, createdAt: now, expiresAt: now + input.expires_in_seconds * 1000,
+        deliveryPolicy: input.delivery, expectsReply: input.expects_reply, inReplyTo: input.in_reply_to,
+        schemaVersion: 1, state: "queued", detail: "Awaiting recipient dispatch",
+      };
+      this.db.prepare(`INSERT INTO channel_messages
+        (message_id, conversation_id, created_at, payload_json, profile, sender_id, recipient_id, idempotency_key, request_json, native_state, expires_at)
+        VALUES (?, ?, ?, ?, 'native', ?, ?, ?, ?, ?, ?)`)
+        .run(message.messageId, message.conversationId, now, JSON.stringify(message), sender.agentId, recipient.agentId,
+          input.idempotency_key ?? null, request, message.state, message.expiresAt);
+      if (reply) this.updateNative({ ...reply, state: "responded", detail: `Reply: ${message.messageId}` });
+      return { message, created: true };
+    });
+  }
+
+  attemptNative(messageId: string, instanceId: string, now = Date.now()): NativeMessage | undefined {
+    return this.transaction(() => {
+      const message = this.nativeMessage(messageId);
+      if (message?.state !== "queued" || message.expiresAt <= now) return undefined;
+      const next: NativeMessage = { ...message, state: "accepted", attemptedAt: now, detail: "Delivery attempt persisted; awaiting runtime receipt" };
+      this.updateNative(next);
+      this.db.prepare("UPDATE channel_messages SET attempt_instance = ? WHERE message_id = ?").run(instanceId, messageId);
+      return next;
+    });
+  }
+
+  receiptNative(messageId: string, instanceId: string, state: NativeMessageState, detail?: string, now = Date.now()): NativeMessage {
+    // Expiry wins over a late receipt; it must not resurrect an unresolved attempt.
+    this.maintainNative(now);
+    return this.transaction(() => {
+      const message = this.nativeMessage(messageId);
+      const row = this.db.prepare("SELECT attempt_instance FROM channel_messages WHERE message_id = ?").get(messageId) as { attempt_instance: string | null } | undefined;
+      if (message?.attemptedAt === undefined || row?.attempt_instance !== instanceId) throw new NativeError(409, "Receipt does not match a delivery attempt");
+      if (message.state === state) return message;
+      if (message.state !== "accepted" && message.state !== "held") {
+        throw new NativeError(409, "Receipt conflicts with the recorded state");
+      }
+      const next = { ...message, state, detail };
+      this.updateNative(next);
+      return next;
+    });
+  }
+
+  interruptNative(agentIds?: string[]): void {
+    this.transaction(() => {
+      for (const message of this.nativeMessages()) {
+        if ((message.state === "accepted" || message.state === "held") && message.attemptedAt !== undefined && (!agentIds || agentIds.includes(message.toAgentId))) {
+          this.updateNative({ ...message, state: "delivery_unknown", detail: "Connection interrupted before runtime acceptance; not retried" });
+        }
+      }
+    });
+  }
+
+  maintainNative(now = Date.now()): void {
+    this.transaction(() => {
+      for (const message of this.nativeMessages()) {
+        if (message.state === "queued" && message.expiresAt <= now) this.updateNative({ ...message, state: "expired", detail: "TTL elapsed before delivery" });
+        if ((message.state === "accepted" || message.state === "held") && message.attemptedAt !== undefined && message.expiresAt <= now) {
+          // A held runtime may release the message without another receipt. No cancellation proof exists.
+          this.updateNative({ ...message, state: "delivery_unknown", detail: "TTL elapsed before runtime acceptance; not retried" });
+        }
+      }
+      const cutoff = now - 30 * 86400_000;
+      this.db.prepare("DELETE FROM channel_acks WHERE message_id IN (SELECT message_id FROM channel_messages WHERE profile = 'native' AND created_at < ?)").run(cutoff);
+      this.db.prepare("DELETE FROM channel_messages WHERE profile = 'native' AND created_at < ?").run(cutoff);
+    });
   }
 
   /** Look up an existing message by id, regardless of conversation. */
   getMessage(messageId: string): ChannelMessage | undefined {
+    this.assertHealthy();
     const row = this.db.prepare(`
       SELECT payload_json
       FROM channel_messages
-      WHERE message_id = ?
+      WHERE profile = 'legacy' AND message_id = ?
     `).get(messageId) as { payload_json: string } | undefined;
     return row ? (JSON.parse(row.payload_json) as ChannelMessage) : undefined;
   }
@@ -174,9 +375,11 @@ export class ChannelStore {
   }
 
   listConversations(filter?: { pendingOnly?: boolean }): ChannelConversationListEntry[] {
+    this.assertHealthy();
     const rows = this.db.prepare(`
       SELECT conversation_id
       FROM channel_messages
+      WHERE profile = 'legacy'
       ORDER BY created_at DESC
     `).all() as Array<{ conversation_id: string }>;
 
@@ -211,20 +414,20 @@ export class ChannelStore {
    *  refreshed via every new inbound message, so the cutoff effectively measures
    *  "time since last activity". */
   deleteConversationsOlderThan(cutoff: number): number {
+    this.assertHealthy();
     const stale = this.db.prepare(`
       SELECT conversation_id, MAX(created_at) AS last_activity
       FROM channel_messages
+      WHERE profile = 'legacy'
       GROUP BY conversation_id
       HAVING last_activity < ?
     `).all(cutoff) as Array<{ conversation_id: string }>;
 
     if (stale.length === 0) return 0;
 
-    // Statements prepared inside the callback so a self-heal reopen re-prepares
-    // them against the fresh handle instead of the closed one.
     this.writable(() => {
-      const deleteMessages = this.db.prepare(`DELETE FROM channel_messages WHERE conversation_id = ?`);
-      const deleteAcks = this.db.prepare(`DELETE FROM channel_acks WHERE conversation_id = ?`);
+      const deleteMessages = this.db.prepare(`DELETE FROM channel_messages WHERE profile = 'legacy' AND conversation_id = ?`);
+      const deleteAcks = this.db.prepare(`DELETE FROM channel_acks WHERE conversation_id = ? AND message_id NOT IN (SELECT message_id FROM channel_messages WHERE profile = 'native')`);
       const deleteSuppressed = this.db.prepare(`DELETE FROM channel_suppressed_conversations WHERE conversation_id = ?`);
       for (const row of stale) {
         deleteMessages.run(row.conversation_id);
@@ -252,8 +455,8 @@ export class ChannelStore {
     if (candidates.length === 0) return 0;
 
     this.writable(() => {
-      const deleteMessages = this.db.prepare(`DELETE FROM channel_messages WHERE conversation_id = ?`);
-      const deleteAcks = this.db.prepare(`DELETE FROM channel_acks WHERE conversation_id = ?`);
+      const deleteMessages = this.db.prepare(`DELETE FROM channel_messages WHERE profile = 'legacy' AND conversation_id = ?`);
+      const deleteAcks = this.db.prepare(`DELETE FROM channel_acks WHERE conversation_id = ? AND message_id NOT IN (SELECT message_id FROM channel_messages WHERE profile = 'native')`);
       const deleteSuppressed = this.db.prepare(`DELETE FROM channel_suppressed_conversations WHERE conversation_id = ?`);
       for (const id of candidates) {
         deleteMessages.run(id);
@@ -289,10 +492,11 @@ export class ChannelStore {
   }
 
   retryMessage(conversationId: string, messageId: string): ChannelMessage | undefined {
+    this.assertHealthy();
     const row = this.db.prepare(`
       SELECT payload_json
       FROM channel_messages
-      WHERE conversation_id = ? AND message_id = ?
+      WHERE profile = 'legacy' AND conversation_id = ? AND message_id = ?
     `).get(conversationId, messageId) as { payload_json: string } | undefined;
 
     if (!row) return undefined;
@@ -308,20 +512,21 @@ export class ChannelStore {
       this.db.prepare(`
         UPDATE channel_messages
         SET created_at = ?, payload_json = ?
-        WHERE message_id = ?
+        WHERE profile = 'legacy' AND message_id = ?
       `).run(retried.createdAt, JSON.stringify(retried), messageId),
     );
-    // Post-heal the row may be gone (fresh DB): report not-found, not success.
+    // Report a missing row rather than a successful retry.
     if (Number(result.changes ?? 0) === 0) return undefined;
 
     return retried;
   }
 
   suppressConversation(conversationId: string): boolean {
+    this.assertHealthy();
     const exists = this.db.prepare(`
       SELECT 1
       FROM channel_messages
-      WHERE conversation_id = ?
+      WHERE profile = 'legacy' AND conversation_id = ?
       LIMIT 1
     `).get(conversationId);
     if (!exists) return false;
@@ -346,6 +551,7 @@ export class ChannelStore {
   }
 
   isConversationSuppressed(conversationId: string): boolean {
+    this.assertHealthy();
     const row = this.db.prepare(`
       SELECT 1
       FROM channel_suppressed_conversations
@@ -359,7 +565,7 @@ export class ChannelStore {
     const rows = this.db.prepare(`
       SELECT payload_json
       FROM channel_messages
-      WHERE conversation_id = ?
+      WHERE profile = 'legacy' AND conversation_id = ?
       ORDER BY created_at ASC
     `).all(conversationId) as Array<{ payload_json: string }>;
 
@@ -370,7 +576,7 @@ export class ChannelStore {
     const rows = this.db.prepare(`
       SELECT payload_json
       FROM channel_acks
-      WHERE conversation_id = ?
+      WHERE conversation_id = ? AND message_id NOT IN (SELECT message_id FROM channel_messages WHERE profile = 'native')
       ORDER BY timestamp ASC
     `).all(conversationId) as Array<{ payload_json: string }>;
 
