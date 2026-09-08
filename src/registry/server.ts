@@ -217,6 +217,13 @@ export class RegistryServer {
         return metadata;
       }) });
     });
+    this.app.post("/native/identity", (req, res) => {
+      const endpoint = this.channelStore.nativeEndpoints().find((agent) => agent.agentId === req.get("x-nab-agent-id"));
+      if (!endpoint || endpoint.harness !== "codex" || !endpoint.reachable || req.body?.name !== endpoint.displayName) throw new NativeError(409, "Identity must match a reachable registered Codex thread");
+      const result = this.channelStore.claimNativeIdentity(endpoint, endpoint.displayName);
+      this.dispatchNative();
+      res.json({ revision: result.revision, changed: result.changed, messageId: result.message?.messageId });
+    });
     this.app.post("/native/messages", (req, res) => {
       const parsed = NativeSendSchema.safeParse(req.body);
       if (!parsed.success) throw new NativeError(400, "Invalid native message payload");

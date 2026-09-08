@@ -3,15 +3,13 @@ import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchManagedCodex } from "./codex-managed.js";
 
 export async function launchHarness(harness: string, options: { name: string; project: string; brokerUrl: string; hostId: string; stateDir: string }) {
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(options.name)) throw new Error("Use a name containing letters, digits, hyphens or underscores");
   const project = resolve(options.project);
   await access(project);
   if (harness === "codex") {
-    const result = await launchManagedCodex({ ...options, project, codexBinary: process.env.NAB_CODEX_BIN ?? join(homedir(), ".local/bin/codex") });
-    process.exitCode = result.exitCode ?? 1; return;
+    throw new Error("Codex runs natively against codex-app-server.service. Start codex in your project and use /rename; NAB does not wrap or spawn Codex.");
   }
   const env = { ...process.env };
   delete env.CLAUDE_CODE_MESSAGING_TOKEN;

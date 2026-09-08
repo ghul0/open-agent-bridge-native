@@ -1,6 +1,6 @@
 # Native Agent Broker
 
-Obowiązują docs/SCOPE_LOCAL_3.md (nadrzędne ustalenia) i docs/SPEC_NATIVE_AGENT_BROKER.md (specyfikacja bazowa).
+Obowiązują docs/SCOPE_SHARED_CODEX.md (nadrzędna korekta centralnego Codexa), docs/SCOPE_LOCAL_3.md i docs/SPEC_NATIVE_AGENT_BROKER.md (specyfikacja bazowa).
 MVP LOCAL_3 obejmuje Claude Code, Codex i czyste Pi. Antigravity, capture bezpośredniego Claude↔Claude i fizyczne rozproszenie są poza odbiorem MVP.
 Rozbudowuj istniejący broker, jedną SQLite i transport HTTP/WS. Nie twórz osobnego brokera.
 Claude używa prawdziwych ListAgents/SendMessage. Bez zastępowania ich MCP, skillem ani terminal injection.

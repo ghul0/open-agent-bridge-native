@@ -15,6 +15,10 @@ import { ClaudeHost } from "./claude-host.js";
 import { brokerRequest } from "./host-link.js";
 import { runNativeMcp } from "./mcp.js";
 import { launchHarness } from "./launch.js";
+import { CodexConnection, DEFAULT_CODEX_URL } from "./codex-connection.js";
+import { inspectCodexProcesses } from "./codex-processes.js";
+import { CodexHost } from "./codex-host.js";
+import { configureCodexMcp, rollbackCodexMcp } from "./codex-config.js";
 
 const stateDirectory = process.env.NAB_STATE_DIR ?? join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "native-agent-broker");
 const configDirectory = process.env.NAB_CONFIG_DIR ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "native-agent-broker");
@@ -61,15 +65,59 @@ program.command("broker").option("--port <number>", "Loopback port", "4998").opt
   process.on("SIGTERM", async () => { await broker.stop(); process.exit(0); });
   process.on("SIGINT", async () => { await broker.stop(); process.exit(0); });
 });
-program.command("host").option("--claude-names <names>", "Restrict native discovery to explicit test names").action(async (options) => {
-  const host = new ClaudeHost(brokerUrl, await hostId(), options.claudeNames?.split(","));
+program.command("host").option("--claude-names <names>", "Restrict native discovery to explicit test names").option("--codex-threads <ids>", "Restrict shared Codex adapter to controlled test thread IDs").option("--no-codex", "Run only Claude native adapter").action(async (options) => {
+  const id = await hostId();
+  const host = new ClaudeHost(brokerUrl, id, options.claudeNames?.split(","));
+  const central = options.codex ? new CodexHost({ brokerUrl, hostId: id, appServerUrl: process.env.NAB_CODEX_URL, threadIds: options.codexThreads?.split(",") }) : undefined;
+  if (central) {
+    const pending = new Set<string>();
+    const confirmed = new Map<string, string>();
+    central.link.onRoster = (agents) => {
+      for (const agent of agents) {
+        if (agent.harness !== "codex" || agent.hostId !== id || agent.instanceId !== central.link.instanceId || !agent.reachable || pending.has(agent.agentId) || confirmed.get(agent.agentId) === agent.displayName) continue;
+        pending.add(agent.agentId);
+        brokerRequest(brokerUrl, "/native/identity", agent.agentId, { name: agent.displayName }).then(() => confirmed.set(agent.agentId, agent.displayName)).catch((error) => central.link.onError(error)).finally(() => pending.delete(agent.agentId));
+      }
+    };
+  }
   await host.start();
-  process.on("SIGTERM", () => { host.stop(); process.exit(0); });
-  process.on("SIGINT", () => { host.stop(); process.exit(0); });
+  try { await central?.start(); } catch (error) { host.stop(); central?.stop(); throw error; }
+  const stop = () => { host.stop(); central?.stop(); process.exit(0); };
+  process.on("SIGTERM", stop); process.on("SIGINT", stop);
 });
 program.command("mcp").action(runNativeMcp);
 program.command("launch").argument("<harness>").requiredOption("--name <name>").requiredOption("--project <path>").action(async (harness, options) => {
   await launchHarness(harness, { ...options, brokerUrl, hostId: await hostId(), stateDir: join(stateDirectory, "sessions") });
+});
+const codex = program.command("codex").description("Operate on native threads in the existing central App Server; never spawn a server");
+codex.command("migrate-bindings").requiredOption("--from <adapters>", "Comma-separated explicitly owned legacy adapter IDs").action(async (options) => {
+  const id = await hostId();
+  const store = new ChannelStore(join(stateDirectory, "ledger.sqlite"));
+  try {
+    const mapping = store.migrateNativeAdapterOwnership(id, options.from.split(","));
+    const manifest = join(stateDirectory, `codex-binding-migration-${Date.now()}.json`);
+    await writeFile(manifest, JSON.stringify(mapping, null, 2), { mode: 0o600 });
+    console.log(JSON.stringify({ migrated: mapping.length, manifest }));
+  } finally { store.close(); }
+});
+codex.command("rollback-bindings").requiredOption("--manifest <path>").action(async (options) => {
+  const store = new ChannelStore(join(stateDirectory, "ledger.sqlite"));
+  try { console.log(JSON.stringify({ restored: store.rollbackNativeAdapterOwnership(JSON.parse(await readFile(options.manifest, "utf8"))).length })); } finally { store.close(); }
+});
+codex.command("configure").action(async () => {
+  const manifest = await configureCodexMcp({ configPath: join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "config.toml"), cliPath: fileURLToPath(import.meta.url), nodePath: process.execPath, brokerUrl, hostId: await hostId(), manifestDir: join(stateDirectory, "config-manifests") });
+  const connection = new CodexConnection({ url: process.env.NAB_CODEX_URL ?? DEFAULT_CODEX_URL });
+  try { await connection.connect(); await connection.request("config/mcpServer/reload", {}); console.log(JSON.stringify({ manifest, reloaded: true })); } finally { connection.close(); }
+});
+codex.command("rollback-config").requiredOption("--manifest <path>").action(async (options) => console.log(JSON.stringify(await rollbackCodexMcp(options.manifest))));
+codex.command("status").action(async () => {
+  const connection = new CodexConnection({ url: process.env.NAB_CODEX_URL ?? DEFAULT_CODEX_URL });
+  try { await connection.connect(); console.log(JSON.stringify({ connected: true, loaded: await connection.request("thread/loaded/list", { limit: 100 }), processes: await inspectCodexProcesses() }, null, 2)); } finally { connection.close(); }
+});
+codex.command("rename").argument("<threadId>").argument("<name>").action(async (threadId, name) => {
+  if (!name.trim() || name.length > 120 || /[\r\n]/.test(name)) throw new Error("Use a nonempty single-line thread name of at most 120 characters");
+  const connection = new CodexConnection({ url: process.env.NAB_CODEX_URL ?? DEFAULT_CODEX_URL });
+  try { await connection.connect(); await connection.request("thread/name/set", { threadId, name }); const view = await connection.request<{ thread: { id: string; name?: string } }>("thread/read", { threadId, includeTurns: false }); console.log(JSON.stringify({ threadId: view.thread.id, name: view.thread.name }, null, 2)); } finally { connection.close(); }
 });
 program.command("agents").option("--json").option("--include-offline").action(async (options) => {
   console.log(JSON.stringify(await brokerRequest(brokerUrl, `/native/agents?include_offline=${Boolean(options.includeOffline)}`), null, 2));
@@ -85,8 +133,9 @@ program.command("doctor").option("--json").action(async () => {
     const health = await brokerRequest<Record<string, unknown>>(brokerUrl, "/native/health");
     const { agents } = await brokerRequest<{ agents: Array<{ harness: string; reachable: boolean }> }>(brokerUrl, "/native/agents");
     const missing = ["claude", "codex", "pi"].filter((h) => !agents.some((a) => a.harness === h && a.reachable));
-    console.log(JSON.stringify({ ...health, missingHarnesses: missing, profile: "LOCAL_3", nativeLocalCapture: "not_enabled" }, null, 2));
-    if (missing.length || health.ok === false) process.exitCode = 1;
+    const codexProcesses = await inspectCodexProcesses();
+    console.log(JSON.stringify({ ...health, missingHarnesses: missing, profile: "LOCAL_3_SHARED_CODEX", nativeLocalCapture: "not_enabled", codexProcesses, singletonEnforcement: "central service ownership; other native entry points are not globally blocked" }, null, 2));
+    if (missing.length || health.ok === false || (codexProcesses.runtimeCount ?? 0) > 1) process.exitCode = 1;
   } catch (error) { console.log(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "Broker unreachable" })); process.exitCode = 1; }
 });
 program.command("backup").requiredOption("--to <path>").action(async (options) => {

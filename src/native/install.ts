@@ -104,7 +104,7 @@ export async function installServices(options: ServiceOptions = {}): Promise<{ m
   const service = `\n[Service]\nType=simple\nRestart=on-failure\nRestartSec=3s\n${env}\n`;
   const units = [
     ["nab-broker.service", `[Unit]\nAfter=network.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n${service}ExecStart=${unitQuote(join(p.binDir, "oab-native"))} broker --host 127.0.0.1 --port ${url.port || "4998"}\n\n[Install]\nWantedBy=default.target\n`],
-    ["nab-host.service", `[Unit]\nAfter=network.target nab-broker.service\nRequires=nab-broker.service\nStartLimitIntervalSec=60\nStartLimitBurst=5\n${service}ExecStart=${unitQuote(join(p.binDir, "oab-native"))} host\n\n[Install]\nWantedBy=default.target\n`],
+    ["nab-host.service", `[Unit]\nAfter=network.target nab-broker.service codex-app-server.service\nRequires=nab-broker.service\nStartLimitIntervalSec=60\nStartLimitBurst=5\n${service}ExecStart=${unitQuote(join(p.binDir, "oab-native"))} host\n\n[Install]\nWantedBy=default.target\n`],
   ] as const;
   const unitPaths: string[] = [], retained = manifest.entries.filter((entry) => !units.some(([name]) => entry.path === join(p.unitDir, name)));
   for (const [name, body] of units) {

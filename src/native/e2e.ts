@@ -4,7 +4,7 @@ import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import WebSocket from "ws";
+import { CodexConnection, DEFAULT_CODEX_URL } from "./codex-connection.js";
 import type { NativeEndpoint, NativeMessage } from "./contracts.js";
 import { claudeEvidence, codexEvidence, jsonLines, piEvidence, verifyRoundtrip, type RuntimeEvidence } from "./evidence.js";
 
@@ -18,10 +18,13 @@ export interface E2EOptions {
   resume?: boolean; keepSessions?: boolean; approveNabTools?: boolean;
   scenarios?: ReadonlyArray<readonly [string, string]>;
   initializePolicy?: boolean;
+  endpointNames?: Partial<Record<(typeof LOCAL_3_ENDPOINTS)[number], string>>;
+  codexConnection?: (url?: string) => CodexConnection;
   command?: (file: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
   fetch?: typeof globalThis.fetch; sleep?: (ms: number) => Promise<void>;
 }
 
+export const LOCAL_3_ENDPOINTS = ["claude-a", "claude-b", "codex-a", "codex-b", "pi-a", "pi-b"] as const;
 export const LOCAL_3_SCENARIOS = [
   ["claude-a", "codex-a"], ["codex-a", "claude-a"], ["claude-a", "pi-a"],
   ["pi-a", "claude-a"], ["codex-a", "pi-a"], ["pi-a", "codex-a"],
@@ -63,40 +66,19 @@ export function claudeProjectDirectory(cwd: string): string {
   return join(homedir(), ".claude", "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
 }
 
-async function readCodexThread(bindingPath: string): Promise<unknown> {
+async function readCodexThread(bindingPath: string, makeConnection: (url?: string) => CodexConnection = (url) => new CodexConnection({ url })): Promise<unknown> {
   const binding = JSON.parse(await readFile(bindingPath, "utf8")) as { appServerUrl: string; threadId: string };
-  const ws = new WebSocket(binding.appServerUrl);
-  let sequence = 0;
-  const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; timer: NodeJS.Timeout }>();
-  ws.on("message", (raw) => {
-    const message = JSON.parse(String(raw));
-    if (message.id !== undefined && message.method) {
-      ws.send(JSON.stringify({ id: message.id, error: { code: -32601, message: "Evidence collector never approves requests" } }));
-      return;
-    }
-    const request = pending.get(message.id);
-    if (!request) return;
-    clearTimeout(request.timer); pending.delete(message.id);
-    message.error ? request.reject(new Error(message.error.message)) : request.resolve(message.result);
-  });
-  await new Promise<void>((resolveOpen, reject) => { ws.once("open", resolveOpen); ws.once("error", reject); });
-  const request = (method: string, params: unknown) => new Promise<any>((resolveRequest, rejectRequest) => {
-    const id = ++sequence;
-    const timer = setTimeout(() => { pending.delete(id); rejectRequest(new Error("Codex evidence RPC timeout")); }, 10_000);
-    pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
-    ws.send(JSON.stringify({ id, method, params }));
-  });
+  const connection = makeConnection(binding.appServerUrl);
   try {
-    await request("initialize", { clientInfo: { name: "nab-e2e-evidence", version: "0.1.0" }, capabilities: { experimentalApi: true } });
-    ws.send(JSON.stringify({ method: "initialized" }));
-    const result = await request("thread/read", { threadId: binding.threadId, includeTurns: true });
+    await connection.connect();
+    const result = await connection.request<{ thread?: { id?: string } }>("thread/read", { threadId: binding.threadId, includeTurns: true });
     if (result.thread?.id !== binding.threadId) throw new Error("Codex evidence thread mismatch");
     return { ...result, binding };
-  } finally { ws.close(); }
+  } finally { connection.close(); }
 }
 
-async function loadEvidence(name: string, endpoint: NativeEndpoint, project: string, runDirectory: string): Promise<RuntimeEvidence> {
-  const kind = harness(name);
+async function loadEvidence(name: string, endpoint: NativeEndpoint, project: string, runDirectory: string, makeConnection?: (url?: string) => CodexConnection): Promise<RuntimeEvidence> {
+  const kind = endpoint.harness;
   if (kind === "claude") return claudeEvidence(await jsonLines(join(claudeProjectDirectory(project), `${endpoint.nativeSessionId}.jsonl`)), endpoint.nativeSessionId);
   if (kind === "pi") {
     const root = process.env.NAB_PI_ROOT ?? join(homedir(), ".local/share/native-agent-broker/pi-clean");
@@ -108,7 +90,7 @@ async function loadEvidence(name: string, endpoint: NativeEndpoint, project: str
     throw new Error("Exact Pi session evidence not found");
   }
   const binding = join(runDirectory, "sessions", name, "binding.json");
-  return codexEvidence(await readCodexThread(binding) as Record<string, unknown>, endpoint.nativeSessionId);
+  return codexEvidence(await readCodexThread(binding, makeConnection) as Record<string, unknown>, endpoint.nativeSessionId);
 }
 
 async function safeWrite(path: string, value: unknown) {
@@ -132,7 +114,11 @@ export async function runE2E(options: E2EOptions): Promise<E2EResult> {
   const sleep = options.sleep ?? delay;
   const tmux = (...args: string[]) => command("tmux", ["-L", namespace, ...args]);
   const target = (name: string) => `local-3:${name}`;
-  const names = ["claude-a", "claude-b", "codex-a", "codex-b", "pi-a", "pi-b"].map((name) => `${name}-${runId}`);
+  const names = LOCAL_3_ENDPOINTS.map((alias) => options.endpointNames?.[alias] ?? `${alias}-${runId}`);
+  const aliasName = (alias: (typeof LOCAL_3_ENDPOINTS)[number]) => options.endpointNames?.[alias] ?? `${alias}-${runId}`;
+  const makeCodexConnection = options.codexConnection ?? ((url) => new CodexConnection({ url: url ?? process.env.NAB_CODEX_URL ?? DEFAULT_CODEX_URL }));
+  const codexThreads = new Map<string, string>();
+  const harnessFor = (name: string) => harness(LOCAL_3_ENDPOINTS[names.indexOf(name)] ?? name);
   const readPane = async (name: string) => (await tmux("capture-pane", "-p", "-t", target(name), "-S", "-200")).stdout;
   const roster = async (): Promise<NativeEndpoint[]> => {
     const response = await request(new URL("/native/agents", options.brokerUrl));
@@ -141,10 +127,10 @@ export async function runE2E(options: E2EOptions): Promise<E2EResult> {
   };
   const approve = async (name: string) => {
     const pane = await readPane(name);
-    if (harness(name) === "claude" && /❯ No, continue without (?:these )?permissions/.test(pane)) {
+    if (harnessFor(name) === "claude" && /❯ No, continue without (?:these )?permissions/.test(pane)) {
       await tmux("send-keys", "-t", target(name), "Enter"); return;
     }
-    if (options.approveNabTools && harness(name) === "codex" && /Allow the native_agent_broker MCP server to run tool "(?:list_agents|send_message)"\?/.test(pane) && /› 1\. Allow/.test(pane) && /enter to submit/.test(pane)) {
+    if (options.approveNabTools && harnessFor(name) === "codex" && /Allow the native_agent_broker MCP server to run tool "(?:list_agents|send_message)"\?/.test(pane) && /› 1\. Allow/.test(pane) && /enter to submit/.test(pane)) {
       await safeWrite(join(runDirectory, `${name}-approved-tool-${Date.now()}.txt`), pane);
       await tmux("send-keys", "-t", target(name), "Down", "Enter");
       await sleep(500);
@@ -166,9 +152,44 @@ export async function runE2E(options: E2EOptions): Promise<E2EResult> {
   const attemptStamp = Date.now();
   try {
     if (!options.resume) for (const name of names) {
-      const launch = `env NAB_BROKER_URL=${JSON.stringify(options.brokerUrl)} NAB_STATE_DIR=${JSON.stringify(runDirectory)} NAB_HOST_ID=${JSON.stringify(`e2e-${runId}`)} ${JSON.stringify(process.execPath)} ${JSON.stringify(launcher)} launch ${harness(name)} --name ${name} --project ${JSON.stringify(project)}`;
-      if (!started) { await tmux("new-session", "-d", "-s", "local-3", "-n", name, "-x", "180", "-y", "50", launch); started = true; }
-      else await tmux("new-window", "-d", "-t", "local-3:", "-n", name, launch);
+      let launch: string;
+      let creator: CodexConnection | undefined;
+      if (harnessFor(name) === "codex") {
+        creator = makeCodexConnection(process.env.NAB_CODEX_URL ?? DEFAULT_CODEX_URL);
+        await creator.connect();
+        const created = await creator.request<{ thread: { id: string } }>("thread/start", { cwd: project, approvalPolicy: "on-request", sandbox: "read-only" });
+        const threadId = created.thread.id;
+        const completed = new Promise<void>((resolveCompleted) => {
+          const listener = (method: string, params: unknown) => {
+            const value = params as { threadId?: string; thread?: { id?: string } } | undefined;
+            if (method === "turn/completed" && (value?.threadId === threadId || value?.thread?.id === threadId)) { creator!.off("notification", listener); resolveCompleted(); }
+          };
+          creator!.on("notification", listener);
+        });
+        await creator.request("turn/start", { threadId, input: [{ type: "text", text: "Reply exactly READY_POLICY. Do not call tools." }] });
+        await Promise.race([completed, sleep(options.readyTimeoutMs ?? 180000).then(() => { throw new Error("Codex rollout turn completion timeout"); })]);
+        await creator.request("thread/name/set", { threadId, name });
+        const codexBinary = process.env.NAB_CODEX_BIN ?? join(homedir(), ".local/bin/codex");
+        launch = `${JSON.stringify(codexBinary)} resume ${threadId}`;
+        codexThreads.set(name, threadId);
+      } else {
+        launch = `env NAB_BROKER_URL=${JSON.stringify(options.brokerUrl)} NAB_STATE_DIR=${JSON.stringify(runDirectory)} ${JSON.stringify(process.execPath)} ${JSON.stringify(launcher)} launch ${harnessFor(name)} --name ${name} --project ${JSON.stringify(project)}`;
+      }
+      if (!started) { await tmux("new-session", "-d", "-s", "local-3", "-n", name, "-c", project, "-x", "180", "-y", "50", launch); started = true; }
+      else await tmux("new-window", "-d", "-t", "local-3:", "-n", name, "-c", project, launch);
+      if (creator) {
+        let attached = false;
+        try {
+          const attachedBy = Date.now() + (options.readyTimeoutMs ?? 180000);
+          while (Date.now() < attachedBy) {
+            const loaded = await creator.request<{ data?: Array<string | { id?: string }> }>("thread/loaded/list", { limit: 100 });
+            const threadId = codexThreads.get(name)!;
+            if (loaded.data?.some((entry) => (typeof entry === "string" ? entry : entry.id) === threadId) && (await readPane(name)).includes("READY_POLICY")) { attached = true; break; }
+            await sleep(500);
+          }
+        } finally { creator.close(); }
+        if (!attached) throw new Error(`Codex TUI attachment timeout for ${name}`);
+      }
     }
     const readyDeadline = Date.now() + (options.readyTimeoutMs ?? 180000);
     let agents: NativeEndpoint[] = [];
@@ -179,6 +200,15 @@ export async function runE2E(options: E2EOptions): Promise<E2EResult> {
       await sleep(500);
     }
     if (!names.every((name) => agents.some((a) => a.displayName === name && a.reachable))) throw new Error("Runtime readiness timeout; no messages sent");
+    for (const endpoint of agents.filter((agent) => agent.harness === "codex" && names.includes(agent.displayName))) {
+      if (!codexThreads.has(endpoint.displayName)) codexThreads.set(endpoint.displayName, endpoint.nativeSessionId);
+    }
+    for (const name of names.filter((value) => codexThreads.has(value))) {
+      const endpoint = agents.find((agent) => agent.displayName === name)!;
+      const path = join(runDirectory, "sessions", name, "binding.json");
+      await mkdir(join(runDirectory, "sessions", name), { recursive: true, mode: 0o700 });
+      await safeWrite(path, { threadId: codexThreads.get(name), agentId: endpoint.agentId, appServerUrl: DEFAULT_CODEX_URL, name });
+    }
     if (options.initializePolicy !== false) {
       for (const name of names) {
         await submit(name, `${policy} Reply exactly READY_POLICY. Do not send any messages now.`);
@@ -187,7 +217,7 @@ export async function runE2E(options: E2EOptions): Promise<E2EResult> {
       await sleep(5000);
     }
     for (const [fromAlias, toAlias] of options.scenarios ?? LOCAL_3_SCENARIOS) {
-      const from = `${fromAlias}-${runId}`, to = `${toAlias}-${runId}`;
+      const from = aliasName(fromAlias as (typeof LOCAL_3_ENDPOINTS)[number]), to = aliasName(toAlias as (typeof LOCAL_3_ENDPOINTS)[number]);
       const sender = agents.find((a) => a.displayName === from)!;
       const recipient = agents.find((a) => a.displayName === to)!;
       let result: E2EScenarioResult = { name: `${fromAlias}->${toAlias}`, from, to, nonce: "", status: "FAIL", detail: "No verified reply", attempts: 0 };
@@ -205,8 +235,8 @@ export async function runE2E(options: E2EOptions): Promise<E2EResult> {
         while (Date.now() < until) {
           await approve(from); await approve(to);
           try {
-            const senderEvidence = await loadEvidence(from, sender, project, runDirectory);
-            const recipientEvidence = await loadEvidence(to, recipient, project, runDirectory);
+            const senderEvidence = await loadEvidence(from, sender, project, runDirectory, makeCodexConnection);
+            const recipientEvidence = await loadEvidence(to, recipient, project, runDirectory, makeCodexConnection);
             const verified = verifyRoundtrip({ sender: senderEvidence, recipient: recipientEvidence, nonce, challenge, senderHarness: sender.harness, recipientHarness: recipient.harness, senderAliases: await endpointAliases(sender), recipientAliases: await endpointAliases(recipient) });
             result.detail = JSON.stringify(verified);
             if (verified.pass) {

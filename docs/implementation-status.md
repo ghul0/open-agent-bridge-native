@@ -1,5 +1,7 @@
 # Status implementacji NAB
 
+**Aktualny zakres: IN_PROGRESS_SHARED_CODEX.** Nadrzędna korekta w SCOPE_SHARED_CODEX.md; postęp w shared-codex-status.md. Poniższy DONE jest historycznym odbiorem wariantu per-session App Server, nie zaliczeniem nowej architektury.
+
 **DONE_LOCAL_3 — odbiór zakończony 2026-09-08.** Obowiązuje SCOPE_LOCAL_3.md, nie historyczny LOCAL_4. Runtime release **0.1.0-9066780**, commit `9066780`. Końcowe dowody: acceptance-final.md; niepowodzenia wcześniejszych prób zachowano.
 
 | Ticket | Stan LOCAL_3 | Kod / test / dowód |
