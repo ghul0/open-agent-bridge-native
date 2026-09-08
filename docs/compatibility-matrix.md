@@ -1,6 +1,6 @@
 # Zgodność LOCAL_3
 
-Data testu: 2026-09-08. Linux x86_64; Node 22.20.0. **Macierz podstawowa ma 9 potwierdzonych roundtripów** na rzeczywistych sesjach, niezależny review w toku. Nie jest to jeszcze odbiór wdrożenia.
+Data testu: 2026-09-08. Linux x86_64; Node 22.20.0. **Macierz podstawowa ma 9 potwierdzonych roundtripów** na rzeczywistych sesjach, niezależny review potwierdził ich autentyczność, a zaostrzony oracle odtworzył 9/9 PASS. Dodatkowo smoke zainstalowanego release i restart/reconnect przeszły. Pełny automatyczny odbiór pozostaje częściowy — patrz implementation-status.md.
 
 | Inicjacja | Wynik końcowej próby | Mechanizm / dowód |
 |---|---|---|

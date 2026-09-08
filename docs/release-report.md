@@ -1,6 +1,6 @@
 # Raport release LOCAL_3
 
-Status: **CANDIDATE — wdrożenie i finalny smoke w toku**. Nie oznaczono DONE_LOCAL_3.
+Status: **PARTIAL_LOCAL_3_RUNNING**. Wdrożono runtime release **0.1.0-6f5f41a**, obie usługi systemd użytkownika są active/enabled. Trzy launchery z nowych powłok i rzeczywiste roundtrips release przeszły; restart usług i reconnect potwierdzone. Nie oznaczono pełnego DONE_LOCAL_3: T16/T19/T24 mają jawne braki odtworzenia, opisane w implementation-status.md.
 
 ## Zrealizowane i zweryfikowane
 
