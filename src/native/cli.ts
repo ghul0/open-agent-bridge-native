@@ -30,10 +30,10 @@ async function hostId() {
   }
 }
 const program = new Command("oab-native").description("Native Agent Broker — LOCAL_3").version("0.1.0");
-program.command("setup").option("--local").option("--harnesses <names>", "LOCAL_3 harnesses", "claude,codex,pi").option("--version <release>", "Release identifier", "0.1.0-local3").action(async (options) => {
+program.command("setup").option("--local").option("--harnesses <names>", "LOCAL_3 harnesses", "claude,codex,pi").option("--release <release>", "Release identifier", "0.1.0-local3").action(async (options) => {
   if (options.harnesses.split(",").some((h: string) => !["claude", "codex", "pi"].includes(h))) throw new Error("Only LOCAL_3 harnesses are in this release");
   if (options.harnesses.split(",").includes("pi")) await setupCleanPi();
-  console.log(JSON.stringify(await setup({ version: options.version, sourceDir: fileURLToPath(new URL("../../", import.meta.url)), brokerUrl, hostId: await hostId() }), null, 2));
+  console.log(JSON.stringify(await setup({ version: options.release, sourceDir: fileURLToPath(new URL("../../", import.meta.url)), brokerUrl, hostId: await hostId() }), null, 2));
 });
 const service = program.command("service");
 service.command("install").option("--user").option("--start").option("--manifest <path>").action(async (options) => {
