@@ -17,6 +17,8 @@ import { runNativeMcp } from "./mcp.js";
 import { launchHarness } from "./launch.js";
 import { CodexConnection, DEFAULT_CODEX_URL } from "./codex-connection.js";
 import { inspectCodexProcesses } from "./codex-processes.js";
+import { codexDiscoveryHealth, shouldNotifyCodexIdentity } from "./codex-discovery-health.js";
+import type { NativeEndpoint } from "./contracts.js";
 import { CodexHost } from "./codex-host.js";
 import { configureCodexMcp, rollbackCodexMcp } from "./codex-config.js";
 
@@ -75,6 +77,8 @@ program.command("host").option("--claude-names <names>", "Restrict native discov
     central.link.onRoster = (agents) => {
       for (const agent of agents) {
         if (agent.harness !== "codex" || agent.hostId !== id || agent.instanceId !== central.link.instanceId || !agent.reachable || pending.has(agent.agentId) || confirmed.get(agent.agentId) === agent.displayName) continue;
+        // A presentation fallback must not generate the first model turn just to name itself.
+        if (!shouldNotifyCodexIdentity(agent)) continue;
         pending.add(agent.agentId);
         brokerRequest(brokerUrl, "/native/identity", agent.agentId, { name: agent.displayName }).then(() => confirmed.set(agent.agentId, agent.displayName)).catch((error) => central.link.onError(error)).finally(() => pending.delete(agent.agentId));
       }
@@ -131,11 +135,22 @@ program.command("messages").option("--include-body").option("--agent <id>").opti
 program.command("doctor").option("--json").action(async () => {
   try {
     const health = await brokerRequest<Record<string, unknown>>(brokerUrl, "/native/health");
-    const { agents } = await brokerRequest<{ agents: Array<{ harness: string; reachable: boolean }> }>(brokerUrl, "/native/agents");
+    const { agents } = await brokerRequest<{ agents: NativeEndpoint[] }>(brokerUrl, "/native/agents");
+    const connection = new CodexConnection({ url: process.env.NAB_CODEX_URL ?? DEFAULT_CODEX_URL });
+    const loaded: string[] = [];
+    try {
+      await connection.connect();
+      let cursor: string | null = null;
+      do {
+        const page: { data: string[]; nextCursor?: string | null } = await connection.request("thread/loaded/list", { limit: 100, cursor });
+        loaded.push(...page.data); cursor = page.nextCursor ?? null;
+      } while (cursor);
+    } finally { connection.close(); }
+    const discovery = codexDiscoveryHealth(loaded, agents, await hostId());
     const missing = ["claude", "codex", "pi"].filter((h) => !agents.some((a) => a.harness === h && a.reachable));
     const codexProcesses = await inspectCodexProcesses();
-    console.log(JSON.stringify({ ...health, missingHarnesses: missing, profile: "LOCAL_3_SHARED_CODEX", nativeLocalCapture: "not_enabled", codexProcesses, singletonEnforcement: "central service ownership; other native entry points are not globally blocked" }, null, 2));
-    if (missing.length || health.ok === false || (codexProcesses.runtimeCount ?? 0) > 1) process.exitCode = 1;
+    console.log(JSON.stringify({ ...health, missingHarnesses: missing, profile: "LOCAL_3_SHARED_CODEX", nativeLocalCapture: "not_enabled", codexDiscovery: discovery, codexProcesses, singletonEnforcement: "central service ownership; other native entry points are not globally blocked" }, null, 2));
+    if (missing.length || !discovery.healthy || health.ok === false || (codexProcesses.runtimeCount ?? 0) > 1) process.exitCode = 1;
   } catch (error) { console.log(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "Broker unreachable" })); process.exitCode = 1; }
 });
 program.command("backup").requiredOption("--to <path>").action(async (options) => {

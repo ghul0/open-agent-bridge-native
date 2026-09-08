@@ -48,7 +48,7 @@ export class CodexHost {
   private reconcileTimer?: NodeJS.Timeout;
   private started = false;
   private reconcileInFlight = false;
-  private needsResubscribe = true;
+  private readonly subscribed = new Set<string>();
   private rosterReady = false;
   private readonly pendingNames = new Map<string, string>();
 
@@ -123,22 +123,34 @@ export class CodexHost {
     if (this.reconcileInFlight || !this.started) return;
     this.reconcileInFlight = true;
     try {
-    if (!this.connection.connected) await this.connection.connect();
-    const listed = await this.listLoadedThreads();
-    const seen = new Set<string>();
-    for (const threadId of listed) {
-      if (this.allowlist && !this.allowlist.has(threadId)) continue;
-      seen.add(threadId);
-      if (!this.threads.has(threadId) || this.needsResubscribe) {
-        const resumed = await this.connection.request<{ thread?: ThreadView }>("thread/resume", { threadId });
-        this.upsert(resumed.thread?.id ? resumed.thread : await this.readThread(threadId, false));
-      } else {
-        this.upsert(await this.readThread(threadId, false));
+      if (!this.connection.connected) await this.connection.connect();
+      const listed = await this.listLoadedThreads();
+      const seen = new Set<string>();
+      for (const threadId of listed) {
+        if (this.allowlist && !this.allowlist.has(threadId)) continue;
+        seen.add(threadId);
+        try {
+          // Loaded in-memory sessions exist before their first persisted rollout.
+          const view = await this.readThread(threadId, false);
+          this.upsert(view);
+          if (!this.subscribed.has(threadId)) {
+            try {
+              await this.connection.request("thread/resume", { threadId });
+              this.subscribed.add(threadId);
+            } catch (error) {
+              if (!(error instanceof RpcError && error.message === `no rollout found for thread id ${threadId}`)) throw error;
+              // Reconcile will retry subscription after a real turn persists the rollout.
+            }
+          }
+        } catch (error) {
+          const record = this.threads.get(threadId);
+          if (record) record.state = "error";
+          this.reportError(error);
+        }
       }
-    }
-    for (const id of this.threads.keys()) if (!seen.has(id)) this.threads.delete(id);
-    this.needsResubscribe = false;
-    this.publish();
+      for (const id of this.threads.keys()) if (!seen.has(id)) {
+        this.threads.delete(id); this.subscribed.delete(id);      }
+      this.publish();
     } finally { this.reconcileInFlight = false; }
   }
 
@@ -202,7 +214,8 @@ export class CodexHost {
       return;
     }
     try {
-      const view = await this.readThread(threadId, true);
+      let view = await this.readThread(threadId, false);
+      if (stateFrom(view) === "active") view = await this.readThread(threadId, true);
       const thread = this.upsert(view);
       if (message.deliveryPolicy === "queue" && thread.state !== "idle") {
         this.link.receipt(message.messageId, "failed", "Thread busy; explicit retry required for queue policy");
@@ -264,7 +277,7 @@ export class CodexHost {
     }
     const threadId = extractThreadId(value);
     if (!threadId || !this.threads.has(threadId)) return;
-    if (method === "thread/closed") { this.threads.delete(threadId); this.publish(); return; }
+    if (method === "thread/closed") { this.threads.delete(threadId); this.subscribed.delete(threadId); this.publish(); return; }
     const thread = this.threads.get(threadId)!;
     if (method === "turn/started") { thread.activeTurnId = extractTurnId(value); thread.state = "active"; }
     else if (method === "turn/completed") { thread.activeTurnId = null; thread.state = thread.approvalIds.size ? "awaiting_approval" : "idle"; }
@@ -292,7 +305,7 @@ export class CodexHost {
   }
 
   private markDisconnected(): void {
-    this.needsResubscribe = true;
+    this.subscribed.clear();
     this.requestThreads.clear();
     for (const thread of this.threads.values()) { thread.approvalIds.clear(); thread.state = "disconnected"; }
     this.publish();
