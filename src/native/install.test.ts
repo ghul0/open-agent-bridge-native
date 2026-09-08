@@ -97,6 +97,19 @@ describe("native local installer", () => {
     await expect(setup({ home: f.home, sourceDir: f.sourceDir, version: "bad-id", hostId: "bad\nvalue" })).rejects.toThrow("Invalid hostId");
   });
 
+  it("preserves service ownership through reinstall and upgrade", async () => {
+    const f = await fixture();
+    const first = await setup({ home: f.home, sourceDir: f.sourceDir, version: "v1" });
+    const services = await installServices({ home: f.home, manifestPath: first.manifestPath });
+    const unit = await readFile(services.unitPaths[0], "utf8");
+    await setup({ home: f.home, sourceDir: f.sourceDir, version: "v1" });
+    const repeated = JSON.parse(await readFile(first.manifestPath, "utf8"));
+    expect(repeated.entries.some((entry: { path: string }) => entry.path === services.unitPaths[0])).toBe(true);
+    const next = await setup({ home: f.home, sourceDir: f.sourceDir, version: "v2" });
+    await installServices({ home: f.home, manifestPath: next.manifestPath });
+    await rollback(next.manifestPath);
+    expect(await readFile(services.unitPaths[0], "utf8")).toBe(unit);
+  });
   it("keeps original ownership metadata across idempotent setup", async () => {
     const f = await fixture(); const first = await setup({ home: f.home, sourceDir: f.sourceDir, version: "repeat" });
     await setup({ home: f.home, sourceDir: f.sourceDir, version: "repeat" });

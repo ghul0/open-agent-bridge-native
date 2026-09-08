@@ -80,7 +80,7 @@ export async function setup(options: SetupOptions): Promise<{ manifestPath: stri
   const oldConfig = configPrior ? await readJson<{ brokerUrl?: string; hostId?: string }>(configPath) : null;
   const stage = `${releaseDir}.stage-${randomUUID()}`; await mkdir(dirname(stage), { recursive: true, mode: 0o700 });
   try { await copyRelease(source, stage); if (await exists(releaseDir)) await rm(releaseDir, { recursive: true }); await rename(stage, releaseDir); } catch (error) { await rm(stage, { recursive: true, force: true }); throw error; }
-  const entries: ManifestEntry[] = [{ path: releaseDir, before: releasePrior?.before ?? null, after: (await hashPath(releaseDir))!, kind: "directory" }];
+  const entries: ManifestEntry[] = [...(prior?.entries ?? []).filter((entry) => ![releaseDir, configPath, launcherPath].includes(entry.path)), { path: releaseDir, before: releasePrior?.before ?? null, after: (await hashPath(releaseDir))!, kind: "directory" }];
   const config = { brokerUrl: options.brokerUrl ?? oldConfig?.brokerUrl ?? "http://127.0.0.1:4998", hostId: options.hostId ?? oldConfig?.hostId ?? randomUUID(), paths: { release: releaseDir, state: p.stateDir, piExtension: join(releaseDir, "dist/native/pi-nab-extension.js") } };
   const backupDir = join(p.dataDir, "backups", options.version);
   await recordWrite(entries, configPath, `${JSON.stringify(config, null, 2)}\n`, 0o600, configPrior, sameConfig ? undefined : backupDir);
@@ -107,7 +107,10 @@ export async function installServices(options: ServiceOptions = {}): Promise<{ m
     ["nab-host.service", `[Unit]\nAfter=network.target nab-broker.service\nRequires=nab-broker.service\nStartLimitIntervalSec=60\nStartLimitBurst=5\n${service}ExecStart=${unitQuote(join(p.binDir, "oab-native"))} host\n\n[Install]\nWantedBy=default.target\n`],
   ] as const;
   const unitPaths: string[] = [], retained = manifest.entries.filter((entry) => !units.some(([name]) => entry.path === join(p.unitDir, name)));
-  for (const [name, body] of units) { const path = join(p.unitDir, name), prior = priorEntry(manifest, path); await recordWrite(retained, path, body, 0o600, prior); unitPaths.push(path); }
+  for (const [name, body] of units) {
+    const path = join(p.unitDir, name), same = priorEntry(manifest, path), owner = same ?? await findOwner(p, path);
+    await recordWrite(retained, path, body, 0o600, owner, same ? undefined : join(p.dataDir, "backups", manifest.version)); unitPaths.push(path);
+  }
   manifest.entries = retained; await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 }); return { manifestPath, unitPaths };
 }
 
