@@ -28,7 +28,7 @@ const REGISTRY_PATH = process.env.PI_AGENT_REGISTRY || join(homedir(), "agents/.
 const AGENT_CTL = process.env.PI_AGENT_CTL || join(homedir(), ".local/bin/pi-agent-ctl");
 const WAKE_TIMEOUT_MS = 120_000;
 
-export type RegistryEntry = { name: string; agentId: string; dir: string };
+export type RegistryEntry = { name: string; agentId: string; dir: string; sees?: string[] };
 
 /** Registered agents keyed by agentId, or undefined when there is no registry
  * at all. Undefined and empty mean different things: no registry is "do not
@@ -41,11 +41,16 @@ export async function readRegistry(path = REGISTRY_PATH): Promise<Map<string, Re
     return undefined;
   }
   try {
-    const parsed = JSON.parse(raw) as { agents?: Record<string, { agentId?: unknown; dir?: unknown }> };
+    const parsed = JSON.parse(raw) as {
+      agents?: Record<string, { agentId?: unknown; dir?: unknown; sees?: unknown }>;
+    };
     const entries = new Map<string, RegistryEntry>();
     for (const [name, value] of Object.entries(parsed.agents ?? {})) {
       if (typeof value?.agentId === "string") {
-        entries.set(value.agentId, { name, agentId: value.agentId, dir: String(value.dir ?? "") });
+        entries.set(value.agentId, {
+          name, agentId: value.agentId, dir: String(value.dir ?? ""),
+          sees: Array.isArray(value.sees) ? value.sees.map(String) : undefined,
+        });
       }
     }
     return entries;
@@ -53,6 +58,19 @@ export async function readRegistry(path = REGISTRY_PATH): Promise<Map<string, Re
     // A half-written registry must not silently widen the roster.
     return new Map();
   }
+}
+
+/** The peers one agent may see, or undefined when it may see them all.
+ *
+ * The list is per agent and directional: a naming b does not let b see a. An
+ * entry with no list sees everyone, so registering a peer never silently cuts
+ * anyone off. */
+export function allowedNames(
+  registry: Map<string, RegistryEntry> | undefined,
+  selfAgentId: string,
+): Set<string> | undefined {
+  const sees = registry?.get(selfAgentId)?.sees;
+  return sees ? new Set(sees) : undefined;
 }
 
 export type RosterRow = { name: string; agentId: string; state: "working" | "idle" | "sleeping"; harness: string };
@@ -67,21 +85,26 @@ export function buildRoster(
   registry: Map<string, RegistryEntry> | undefined,
   selfAgentId: string,
 ): RosterRow[] {
+  const allowed = allowedNames(registry, selfAgentId);
+  const visible = (entry: RegistryEntry | undefined) => !allowed || (entry !== undefined && allowed.has(entry.name));
+
   const rows: RosterRow[] = [];
   const seen = new Set<string>();
   for (const peer of live) {
     if (peer.agentId === selfAgentId || !peer.reachable) continue;
-    if (registry && !registry.has(peer.agentId)) continue;
+    const entry = registry?.get(peer.agentId);
+    if (registry && !entry) continue;
+    if (!visible(entry)) continue;
     seen.add(peer.agentId);
     rows.push({
-      name: registry?.get(peer.agentId)?.name ?? peer.displayName,
+      name: entry?.name ?? peer.displayName,
       agentId: peer.agentId,
       state: peer.state === "active" ? "working" : "idle",
       harness: peer.harness,
     });
   }
   for (const entry of registry?.values() ?? []) {
-    if (entry.agentId === selfAgentId || seen.has(entry.agentId)) continue;
+    if (entry.agentId === selfAgentId || seen.has(entry.agentId) || !visible(entry)) continue;
     rows.push({ name: entry.name, agentId: entry.agentId, state: "sleeping", harness: "pi" });
   }
   return rows.sort((left, right) => left.name.localeCompare(right.name));
@@ -168,6 +191,18 @@ export default function nabPiExtension(pi: ExtensionAPI) {
     name: "send_message", label: "Send message", description: "Send text to an exact native NAB agent ID.", parameters: SEND_MESSAGE_SCHEMA,
     async execute(_id, params) {
       if (!agentId) throw new Error("NAB session binding is not initialized");
+
+      // Listing and sending have to agree: an agent that cannot see a peer
+      // must not reach it by quoting an agentId it learned elsewhere.
+      const registry = await readRegistry();
+      const allowed = allowedNames(registry, agentId);
+      if (allowed) {
+        const target = registry?.get(params.to);
+        if (!target || !allowed.has(target.name)) {
+          throw new Error(`${params.to} is not among the agents you can message; call list_agents for the ones you can`);
+        }
+      }
+
       const send = () => sendMessage(baseUrl(), agentId, {
         to: params.to, text: params.text, conversation_id: params.conversation_id, in_reply_to: params.in_reply_to,
         delivery: params.delivery || "auto", expects_reply: params.expects_reply ?? false, expires_in_seconds: 600, idempotency_key: randomUUID(),
@@ -180,7 +215,7 @@ export default function nabPiExtension(pi: ExtensionAPI) {
         // A sleeping agent is not an error the caller should have to handle:
         // start it and deliver. Waking is silent by design, so sending looks
         // the same whether the recipient was up or not.
-        const entry = (await readRegistry())?.get(params.to);
+        const entry = registry?.get(params.to);
         if (!entry) throw error;
         await wakeAgent(entry.name);
         result = await send();
