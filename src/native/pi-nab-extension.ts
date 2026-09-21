@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { nativeAgentId, type NativeEndpoint, type NativeMessage } from "./contracts.js";
 import { brokerRequest, HostLink, peerText, sendMessage } from "./host-link.js";
 
@@ -18,7 +22,91 @@ type ExtensionAPI = {
 const CUSTOM_TYPE = "peer";
 const baseUrl = () => (process.env.NAB_BROKER_URL || "http://127.0.0.1:4999").replace(/\/$/, "") + "/";
 
-export const LIST_AGENTS_SCHEMA = { type: "object", properties: {}, additionalProperties: false } as const;
+/** Supervisor state for the agents under ~/agents. Absent on hosts that do not
+ * run them, in which case the roster is unrestricted, exactly as before. */
+const REGISTRY_PATH = process.env.PI_AGENT_REGISTRY || join(homedir(), "agents/.runtime/agents.json");
+const AGENT_CTL = process.env.PI_AGENT_CTL || join(homedir(), ".local/bin/pi-agent-ctl");
+const WAKE_TIMEOUT_MS = 120_000;
+
+export type RegistryEntry = { name: string; agentId: string; dir: string };
+
+/** Registered agents keyed by agentId, or undefined when there is no registry
+ * at all. Undefined and empty mean different things: no registry is "do not
+ * filter", an empty one is "nothing is visible". */
+export async function readRegistry(path = REGISTRY_PATH): Promise<Map<string, RegistryEntry> | undefined> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { agents?: Record<string, { agentId?: unknown; dir?: unknown }> };
+    const entries = new Map<string, RegistryEntry>();
+    for (const [name, value] of Object.entries(parsed.agents ?? {})) {
+      if (typeof value?.agentId === "string") {
+        entries.set(value.agentId, { name, agentId: value.agentId, dir: String(value.dir ?? "") });
+      }
+    }
+    return entries;
+  } catch {
+    // A half-written registry must not silently widen the roster.
+    return new Map();
+  }
+}
+
+export type RosterRow = { name: string; agentId: string; state: "working" | "idle" | "sleeping"; harness: string };
+
+/** Merge the live endpoints with the registry.
+ *
+ * Three states, all derived: the broker knows who is running, the registry
+ * knows who exists. An agent in the registry but not in the roster is asleep —
+ * it still has an address and can be woken, so it belongs on the list. */
+export function buildRoster(
+  live: NativeEndpoint[],
+  registry: Map<string, RegistryEntry> | undefined,
+  selfAgentId: string,
+): RosterRow[] {
+  const rows: RosterRow[] = [];
+  const seen = new Set<string>();
+  for (const peer of live) {
+    if (peer.agentId === selfAgentId || !peer.reachable) continue;
+    if (registry && !registry.has(peer.agentId)) continue;
+    seen.add(peer.agentId);
+    rows.push({
+      name: registry?.get(peer.agentId)?.name ?? peer.displayName,
+      agentId: peer.agentId,
+      state: peer.state === "active" ? "working" : "idle",
+      harness: peer.harness,
+    });
+  }
+  for (const entry of registry?.values() ?? []) {
+    if (entry.agentId === selfAgentId || seen.has(entry.agentId)) continue;
+    rows.push({ name: entry.name, agentId: entry.agentId, state: "sleeping", harness: "pi" });
+  }
+  return rows.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+/** Start a sleeping agent and wait for it to register. */
+function wakeAgent(name: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(AGENT_CTL, ["wake", name], { timeout: WAKE_TIMEOUT_MS }, (error) => {
+      error ? reject(new Error(`could not wake ${name}: ${error.message}`)) : resolve();
+    });
+  });
+}
+
+export const LIST_AGENTS_SCHEMA = {
+  type: "object",
+  properties: {
+    scope: {
+      type: "string",
+      enum: ["agents", "all"],
+      description: "'agents' (default) lists your fellow agents; 'all' also lists unrelated sessions on this host.",
+    },
+  },
+  additionalProperties: false,
+} as const;
 export const SEND_MESSAGE_SCHEMA = {
   type: "object",
   properties: {
@@ -62,11 +150,17 @@ export default function nabPiExtension(pi: ExtensionAPI) {
   }
 
   pi.registerTool({
-    name: "list_agents", label: "List agents", description: "List reachable native NAB peers.", parameters: LIST_AGENTS_SCHEMA,
-    async execute() {
+    name: "list_agents", label: "List agents",
+    description: "List the agents you can message. Each is working (mid-task), idle, or sleeping. Sleeping agents are reachable exactly like the others — send_message wakes them for you.",
+    parameters: LIST_AGENTS_SCHEMA,
+    async execute(_id, params) {
       const fetched = await brokerRequest<{ agents: NativeEndpoint[] }>(baseUrl(), "/native/agents");
-      const peers = fetched.agents.filter((peer) => peer.agentId !== agentId && peer.reachable);
-      return { content: [{ type: "text", text: peers.length ? peers.map((p) => `${p.displayName}\t${p.agentId}\t${p.harness}\t${p.state}`).join("\n") : "No peers available." }], details: { peers } };
+      const registry = params?.scope === "all" ? undefined : await readRegistry();
+      const peers = buildRoster(fetched.agents, registry, agentId);
+      return {
+        content: [{ type: "text", text: peers.length ? peers.map((p) => `${p.name}\t${p.agentId}\t${p.harness}\t${p.state}`).join("\n") : "No peers available." }],
+        details: { peers },
+      };
     },
   });
 
@@ -74,10 +168,23 @@ export default function nabPiExtension(pi: ExtensionAPI) {
     name: "send_message", label: "Send message", description: "Send text to an exact native NAB agent ID.", parameters: SEND_MESSAGE_SCHEMA,
     async execute(_id, params) {
       if (!agentId) throw new Error("NAB session binding is not initialized");
-      const result = await sendMessage(baseUrl(), agentId, {
+      const send = () => sendMessage(baseUrl(), agentId, {
         to: params.to, text: params.text, conversation_id: params.conversation_id, in_reply_to: params.in_reply_to,
         delivery: params.delivery || "auto", expects_reply: params.expects_reply ?? false, expires_in_seconds: 600, idempotency_key: randomUUID(),
       });
+
+      let result: Awaited<ReturnType<typeof sendMessage>>;
+      try {
+        result = await send();
+      } catch (error) {
+        // A sleeping agent is not an error the caller should have to handle:
+        // start it and deliver. Waking is silent by design, so sending looks
+        // the same whether the recipient was up or not.
+        const entry = (await readRegistry())?.get(params.to);
+        if (!entry) throw error;
+        await wakeAgent(entry.name);
+        result = await send();
+      }
       return { content: [{ type: "text", text: `Accepted by broker: conversation=${result.conversationId} message=${result.messageId}` }], details: result };
     },
   });
