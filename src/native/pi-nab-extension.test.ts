@@ -195,9 +195,19 @@ describe("peerText", () => {
     // reply address that loops back to itself — which is how one agent ended
     // up reasoning about "an echo of my own message".
     const text = peerText(message({ fromAgentId: "nab:host:pi:same", toAgentId: "nab:host:pi:same" }));
-    expect(text).toBe("[system] treść");
+    expect(text).toMatch(/^\[system \d{2}\/\d{2} \d{2}:\d{2}\] treść$/);
     expect(text).not.toContain("from_agent_id");
     expect(text).not.toContain("send_message");
+  });
+
+  it("stamps the system line, because Pi never tells the model the time", () => {
+    // A scheduled message read hours later — after a long turn, or in a
+    // session resumed the next morning — otherwise looks like it just arrived.
+    const at = Date.UTC(2026, 8, 22, 5, 7);
+    const text = peerText(message({
+      fromAgentId: "nab:host:pi:same", toAgentId: "nab:host:pi:same", createdAt: at,
+    }));
+    expect(text).toContain("22/09");
   });
 
   it("still treats a different sender on the same host as a peer", () => {
