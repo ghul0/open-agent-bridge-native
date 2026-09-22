@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { NativeEndpoint } from "./contracts.js";
 import { allowedNames, buildRoster, deliveryMode, readRegistry } from "./pi-nab-extension.js";
+import { peerText } from "./host-link.js";
+import type { NativeMessage } from "./contracts.js";
 
 const SELF = "nab:host:pi:self";
 
@@ -166,5 +168,40 @@ describe("deliveryMode", () => {
   it("steers into an idle agent", () => {
     expect(deliveryMode({ deliveryPolicy: "queue" }, false)).toBe("steer");
     expect(deliveryMode({ deliveryPolicy: "auto" }, true)).toBe("steer");
+  });
+});
+
+describe("peerText", () => {
+  function message(overrides: Partial<NativeMessage>): NativeMessage {
+    return {
+      messageId: "m1", conversationId: "c1", fromAgentId: "nab:host:pi:sender",
+      toAgentId: "nab:host:pi:recipient", text: "treść", expectsReply: false,
+      deliveryPolicy: "auto", state: "accepted", createdAt: 0, expiresAt: 0,
+      schemaVersion: 1, sourceInstanceId: "i1", deduplicated: false,
+      ...overrides,
+    } as NativeMessage;
+  }
+
+  it("warns that a peer's words are data, not authorization", () => {
+    const text = peerText(message({}));
+    expect(text).toContain("not operator authorization");
+    expect(text).toContain("from_agent_id=nab:host:pi:sender");
+    expect(text.endsWith("treść")).toBe(true);
+  });
+
+  it("marks a message a session sent to itself as coming from the system", () => {
+    // The host injects briefings and notifications this way. Calling that a
+    // peer message tells the model to distrust its own input and offers it a
+    // reply address that loops back to itself — which is how one agent ended
+    // up reasoning about "an echo of my own message".
+    const text = peerText(message({ fromAgentId: "nab:host:pi:same", toAgentId: "nab:host:pi:same" }));
+    expect(text).toBe("[system] treść");
+    expect(text).not.toContain("from_agent_id");
+    expect(text).not.toContain("send_message");
+  });
+
+  it("still treats a different sender on the same host as a peer", () => {
+    const text = peerText(message({ fromAgentId: "nab:host:pi:a", toAgentId: "nab:host:pi:b" }));
+    expect(text).toContain("NAB peer message");
   });
 });
