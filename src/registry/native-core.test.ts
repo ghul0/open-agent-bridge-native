@@ -58,6 +58,118 @@ describe("native registry transport fixtures", () => {
     return (await (await fetch(`${server.address}/native/messages`)).json()).messages;
   }
 
+  it("reports exact ASCII and UTF-8 rejection sizes without leaking content or metadata", async () => {
+    const a = endpoint("host-a", "source");
+    const b = endpoint("host-b", "target");
+    await connect(a.hostId, [a]);
+    const receiver = await connect(b.hostId, [b]);
+    for (const text of ["x".repeat(262145), "😀".repeat(65537)]) {
+      const result = await send(a.agentId, b.agentId, { text, conversation_id: "SECRET", password: "SECRET", from: "spoof" });
+      expect(result.status).toBe(413);
+      expect(result.body).toMatchObject({ code: "text_too_large", limit_bytes: 262144,
+        actual_bytes: Buffer.byteLength(text, "utf8"), notification: "queued" });
+      expect(result.body.error).toContain(`${Buffer.byteLength(text, "utf8")} bytes`);
+    }
+    await expect.poll(() => receiver.deliveries().length).toBe(1);
+    const full = (await (await fetch(`${server.address}/native/messages?include_body=true`)).json()).messages;
+    expect(full).toHaveLength(2);
+    for (const notice of full) {
+      expect(notice.fromAgentId).toBe(b.agentId);
+      expect(notice.expectsReply).toBe(false);
+      expect(notice.text).toContain("technical delivery failure");
+      expect(notice.text).toContain(a.agentId);
+      expect(notice.text).not.toContain("SECRET");
+      expect(notice.text).not.toContain("spoof");
+      expect(notice.text.length).toBeLessThan(1500);
+    }
+  });
+
+  it("caps canonical source metadata and never copies a declared source or display name", async () => {
+    const a = endpoint("host-a", "a".repeat(300)); a.displayName = "PRIVATE DISPLAY NAME";
+    const b = endpoint("host-b", "target");
+    await connect(a.hostId, [a]); await connect(b.hostId, [b]);
+    await send(a.agentId, b.agentId, { text: null, fromAgentId: "DECLARED SOURCE", conversation_id: "PRIVATE CONVERSATION" });
+    const full = (await (await fetch(`${server.address}/native/messages?include_body=true`)).json()).messages;
+    const metadata = JSON.parse(full[0].text.split("\n").at(-1));
+    expect(metadata.source_agent_id).toBe(a.agentId.slice(0, 256));
+    expect(Object.keys(metadata).sort()).toEqual(["reason", "recipient_agent_id", "source_agent_id", "source_harness"]);
+    expect(full[0].text).not.toContain("PRIVATE");
+    expect(full[0].text).not.toContain("DECLARED");
+  });
+
+  it("rejects unsupported WS send frames without trusting their source or target", async () => {
+    const a = endpoint("host-a", "source"); const b = endpoint("host-b", "target");
+    const sender = await connect(a.hostId, [a]); const receiver = await connect(b.hostId, [b]);
+    sender.ws.send(JSON.stringify({ type: "native.send", to: b.agentId, from: a.agentId, text: null }));
+    await expect.poll(() => sender.frames.some((frame) => frame.type === "native.error")).toBe(true);
+    expect(receiver.deliveries()).toHaveLength(0);
+    expect(await messages()).toHaveLength(0);
+  });
+
+  it("notifies about invalid payloads and durably deduplicates rejection retries", async () => {
+    const a = endpoint("host-a", "source"); const b = endpoint("host-b", "target");
+    await connect(a.hostId, [a]); await connect(b.hostId, [b]);
+    const input = { text: { secret: "do-not-copy" }, idempotency_key: "rejected-op", extra: "do-not-copy" };
+    const first = await send(a.agentId, b.agentId, input);
+    expect(first).toMatchObject({ status: 400, body: { code: "invalid_payload", notification: "queued" } });
+    expect((await send(a.agentId, b.agentId, input)).body.notification).toBe("deduplicated");
+    expect(await messages()).toHaveLength(1);
+    const full = (await (await fetch(`${server.address}/native/messages?include_body=true`)).json()).messages;
+    expect(full[0].text).not.toContain("do-not-copy");
+    // Also dedupe requests without a model-supplied operation ID.
+    await send(a.agentId, b.agentId, { text: null });
+    await send(a.agentId, b.agentId, { text: null });
+    expect(await messages()).toHaveLength(2);
+  });
+
+  it("does not notify invalid targets, ambiguous names or unbound sources", async () => {
+    const a = endpoint("host-a", "source"); const b = endpoint("host-b", "same");
+    const c = endpoint("host-c", "same");
+    await connect(a.hostId, [a]); await connect(b.hostId, [b]); await connect(c.hostId, [c]);
+    for (const target of [null, 42, "", "x".repeat(513), "missing", "same"]) {
+      expect((await send(a.agentId, target as string, { text: null })).body.notification).toBe("skipped");
+    }
+    expect((await send("unknown", b.agentId, { text: null, from: a.agentId })).body.notification).toBe("skipped");
+    expect(await messages()).toHaveLength(0);
+  });
+
+  it("queues offline notices and preserves errors when notification storage fails", async () => {
+    const a = endpoint("host-a", "source"); const b = endpoint("host-b", "target");
+    await connect(a.hostId, [a]); const receiver = await connect(b.hostId, [b]);
+    await receiver.register([{ ...b, reachable: false }]);
+    expect((await send(a.agentId, b.agentId, { text: null })).body.notification).toBe("queued");
+    expect(receiver.deliveries()).toHaveLength(0);
+    vi.spyOn(ChannelStore.prototype, "acceptNative").mockImplementation(() => { throw new Error("synthetic storage failure"); });
+    const result = await send(a.agentId, b.agentId, { text: "x".repeat(262145) });
+    expect(result).toMatchObject({ status: 413, body: { actual_bytes: 262145, notification: "failed" } });
+    expect(result.body.error).not.toContain("storage");
+    vi.spyOn(ChannelStore.prototype, "nativeEndpoints").mockImplementation(() => { throw new Error("synthetic roster failure"); });
+    const unavailable = await send(a.agentId, b.agentId, { text: "x".repeat(262145) });
+    expect(unavailable).toMatchObject({ status: 413, body: { actual_bytes: 262145, notification: "skipped" } });
+  });
+
+  it("bounds technical notices with existing durable recipient rate limits", async () => {
+    const a = endpoint("host-a", "source"); const b = endpoint("host-b", "target");
+    await connect(a.hostId, [a]); await connect(b.hostId, [b]);
+    for (let index = 0; index < 30; index++) {
+      expect((await send(a.agentId, b.agentId, { text: null, idempotency_key: `reject-${index}` })).body.notification).toBe("queued");
+    }
+    const limited = await send(a.agentId, b.agentId, { text: null, idempotency_key: "overflow" });
+    expect(limited).toMatchObject({ status: 400, body: { notification: "failed", code: "invalid_payload" } });
+    expect(await messages()).toHaveLength(30);
+    expect((await send(a.agentId, b.agentId, { text: null, idempotency_key: "reject-0" })).body.notification).toBe("deduplicated");
+  });
+
+  it("rejects HTTP parser overflow without guessing text size or notifying a target", async () => {
+    const a = endpoint("host-a", "source"); const b = endpoint("host-b", "target");
+    await connect(a.hostId, [a]); await connect(b.hostId, [b]);
+    const result = await send(a.agentId, b.agentId, { text: "x".repeat(2 * 1024 * 1024) });
+    expect(result.status).toBe(413);
+    expect(result.body.error).toContain("2 MiB parser limit");
+    expect(result.body).not.toHaveProperty("actual_bytes");
+    expect(await messages()).toHaveLength(0);
+  });
+
   it("routes only to the recipient adapter across two logical hosts and hides message bodies", async () => {
     const a = endpoint("logical-host-a", "same-cwd-one");
     const b = endpoint("logical-host-b", "same-cwd-two");
@@ -97,7 +209,7 @@ describe("native registry transport fixtures", () => {
     expect((await send(a.agentId, b.agentId, { text })).status).toBe(201);
     await expect.poll(() => receiver.deliveries().length).toBe(1);
     expect(receiver.deliveries()[0].message.text).toBe(text);
-    expect((await send(a.agentId, b.agentId, { text: "ż".repeat(128 * 1024) + "x" })).status).toBe(400);
+    expect((await send(a.agentId, b.agentId, { text: "ż".repeat(128 * 1024) + "x" })).status).toBe(413);
   });
 
   it("supports independent adapters and sessions on one host without cwd dedup or snapshot theft", async () => {

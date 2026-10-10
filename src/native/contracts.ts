@@ -84,7 +84,7 @@ export type NativeServerFrame =
   | { type: "native.error"; error: string };
 
 export class NativeError extends Error {
-  constructor(public readonly status: number, message: string) {
+  constructor(public readonly status: number, message: string, public readonly details?: { code: string; limit_bytes?: number; actual_bytes?: number; notification?: "skipped" | "queued" | "deduplicated" | "failed" }) {
     super(message);
   }
 }

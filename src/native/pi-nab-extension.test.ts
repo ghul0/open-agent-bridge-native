@@ -1,11 +1,21 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { NativeSendSchema, type NativeEndpoint } from "./contracts.js";
-import { allowedNames, buildRoster, deliveryMode, readRegistry, SEND_MESSAGE_SCHEMA } from "./pi-nab-extension.js";
-import { peerText } from "./host-link.js";
+import nabPiExtension, { allowedNames, buildRoster, deliveryMode, readRegistry, SEND_MESSAGE_SCHEMA } from "./pi-nab-extension.js";
+import { HostLink, peerText, sendMessage } from "./host-link.js";
 import type { NativeMessage } from "./contracts.js";
+
+vi.mock("node:fs/promises", async (original) => {
+  const actual = await original<typeof import("node:fs/promises")>();
+  return { ...actual, readFile: vi.fn(actual.readFile) };
+});
+vi.mock("./host-link.js", async (original) => {
+  const actual = await original<typeof import("./host-link.js")>();
+  return { ...actual, sendMessage: vi.fn(actual.sendMessage) };
+});
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 const SELF = "nab:host:pi:self";
 
@@ -220,10 +230,48 @@ describe("peerText", () => {
 describe("UTF-8 message limits", () => {
   it("accepts exactly 256 KiB and rejects an extra byte", () => {
     const limit = 256 * 1024;
-    expect(SEND_MESSAGE_SCHEMA.properties.text.maxLength).toBe(limit);
+    expect(SEND_MESSAGE_SCHEMA.properties.text).not.toHaveProperty("maxLength");
     for (const text of ["a".repeat(limit), "ż".repeat(limit / 2), "😀".repeat(limit / 4)]) {
       expect(NativeSendSchema.parse({ to: SELF, text }).text).toBe(text);
       expect(() => NativeSendSchema.parse({ to: SELF, text: text + "x" })).toThrow("256 KiB");
     }
+  });
+});
+
+describe("Pi rejection forwarding", () => {
+  async function toolFixture() {
+    vi.stubEnv("NAB_HOST_ID", "host");
+    vi.spyOn(HostLink.prototype, "start").mockImplementation(() => {});
+    type API = Parameters<typeof nabPiExtension>[0];
+    const tools = new Map<string, Parameters<API["registerTool"]>[0]>();
+    const events = new Map<string, Parameters<API["on"]>[1]>();
+    nabPiExtension({ registerTool: (tool) => { tools.set(tool.name, tool); },
+      sendMessage: () => {}, on: (name, handler) => { events.set(name, handler); } });
+    const start = events.get("session_start");
+    if (!start) throw new Error("Missing session handler");
+    await start({}, { sessionManager: { getSessionId: () => "self", getEntries: () => [] }, ui: { setStatus: () => {} } });
+    const tool = tools.get("send_message");
+    if (!tool) throw new Error("Missing send tool");
+    return tool;
+  }
+  it("forwards oversized text to the broker after permission checks and does not wake/retry on 413", async () => {
+    const tool = await toolFixture();
+    vi.mocked(readFile).mockResolvedValueOnce(JSON.stringify({ agents: {
+      self: { agentId: SELF, sees: ["peer"] }, peer: { agentId: "nab:host:pi:peer" },
+    } }));
+    vi.mocked(sendMessage).mockRejectedValueOnce(new Error("Broker 413: Text exceeds 256 KiB UTF-8 limit (262144 bytes); actual size: 262145 bytes"));
+    const text = "x".repeat(262145);
+    await expect(tool.execute("call", { to: "nab:host:pi:peer", text })).rejects.toThrow("262145 bytes");
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(expect.any(String), SELF, expect.objectContaining({ text, to: "nab:host:pi:peer" }));
+    vi.mocked(sendMessage).mockClear();
+  });
+  it("rejects an unauthorized target before forwarding even oversized text", async () => {
+    const tool = await toolFixture();
+    vi.mocked(readFile).mockResolvedValueOnce(JSON.stringify({ agents: {
+      self: { agentId: SELF, sees: [] }, peer: { agentId: "nab:host:pi:peer" },
+    } }));
+    await expect(tool.execute("call", { to: "nab:host:pi:peer", text: "x".repeat(262145) })).rejects.toThrow("not among the agents");
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 });

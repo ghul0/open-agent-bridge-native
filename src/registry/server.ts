@@ -1,5 +1,6 @@
 // Registry HTTP server — central discovery service on :4999
 import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -196,6 +197,47 @@ export class RegistryServer {
     ws.terminate();
   }
 
+  private rejectNativePayload(body: unknown, sender: NativeEndpoint | undefined): NativeError {
+    const input = body && typeof body === "object" && !Array.isArray(body) ? body as Record<string, unknown> : {};
+    const actualBytes = typeof input.text === "string" ? Buffer.byteLength(input.text, "utf8") : undefined;
+    const oversized = actualBytes !== undefined && actualBytes > 256 * 1024;
+    const reason = oversized ? "text_too_large" : "invalid_payload";
+    const details: NonNullable<NativeError["details"]> = { code: reason, notification: "skipped",
+      ...(oversized ? { limit_bytes: 256 * 1024, actual_bytes: actualBytes } : {}) };
+    const error = new NativeError(oversized ? 413 : 400,
+      oversized ? `Text exceeds 256 KiB UTF-8 limit (262144 bytes); actual size: ${actualBytes} bytes` : "Invalid native message payload", details);
+    // HTTP identity is the existing trusted-network session binding, not authentication or a body field.
+    // Do not notify on behalf of a stale/unregistered session or guess an invalid target.
+    try {
+      const host = sender && this.nativeHosts.get(this.channelStore.nativeAdapterKey(sender.agentId) ?? "");
+      if (!sender?.reachable || !host || host.ws.readyState !== WebSocket.OPEN || Date.now() - host.lastSeen >= 60_000) return error;
+      if (typeof input.to !== "string" || input.to.length < 1 || input.to.length > 512) return error;
+      const endpoints = this.channelStore.nativeEndpoints();
+      const exact = endpoints.filter((agent) => agent.agentId === input.to);
+      const matches = exact.length ? exact : endpoints.filter((agent) => agent.displayName === input.to);
+      const recipient = matches[0];
+      if (matches.length !== 1 || !recipient) return error;
+      // Only broker-known identities, fixed reasons and sizes survive. No user metadata/body.
+      const safeId = (value: string) => value.replace(/[^a-zA-Z0-9:_%./~-]/g, "").slice(0, 256);
+      const metadata = { source_agent_id: safeId(sender.agentId), source_harness: sender.harness,
+        recipient_agent_id: safeId(recipient.agentId), reason,
+        ...(oversized ? { limit_bytes: 256 * 1024, actual_bytes: actualBytes } : {}) };
+      const operation = typeof input.idempotency_key === "string" && input.idempotency_key.length <= 512
+        ? input.idempotency_key : JSON.stringify(input);
+      const digest = createHash("sha256").update(JSON.stringify([sender.agentId, recipient.agentId, operation])).digest("hex");
+      // A self-addressed system notice cannot impersonate the source or solicit a reply.
+      // Reuse the durable outbox, dedupe ledger, TTL, queue and rate limits (30 notices/recipient/min).
+      details.notification = "failed";
+      const result = this.channelStore.acceptNative(recipient, NativeSendSchema.parse({ to: recipient.agentId,
+        text: `[NAB technical delivery failure — not a user message]\nA message was rejected and did not arrive. Original content is omitted. Do not reply automatically.\n${JSON.stringify(metadata)}`,
+        delivery: "queue", expects_reply: false, expires_in_seconds: 600, idempotency_key: `nab-rejection:${digest}`,
+      }), () => recipient);
+      details.notification = result.created ? "queued" : "deduplicated";
+      this.dispatchNative();
+    } catch { /* Notification failure must never replace the precise sender error. */ }
+    return error;
+  }
+
   private setupNativeRoutes(): void {
     this.app.get("/native/health", (_req, res) => {
       this.channelStore.assertHealthy();
@@ -226,7 +268,12 @@ export class RegistryServer {
     });
     this.app.post("/native/messages", (req, res) => {
       const parsed = NativeSendSchema.safeParse(req.body);
-      if (!parsed.success) throw new NativeError(400, "Invalid native message payload");
+      if (!parsed.success) {
+        let sender: NativeEndpoint | undefined;
+        try { sender = this.channelStore.nativeEndpoints().find((agent) => agent.agentId === req.get("x-nab-agent-id")); }
+        catch { /* Unknown source: skip notification but retain the payload error. */ }
+        throw this.rejectNativePayload(req.body, sender);
+      }
       const endpoints = this.channelStore.nativeEndpoints();
       const sender = endpoints.find((agent) => agent.agentId === req.get("x-nab-agent-id"));
       if (!sender) throw new NativeError(400, "A registered sender binding is required");
@@ -255,9 +302,13 @@ export class RegistryServer {
     // No legacy mutation, history, event broadcast or relay in the native profile.
     this.app.use((_req, res) => { res.status(404).json({ error: "Route unavailable in native profile" }); });
     this.app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-      const status = error instanceof NativeError ? error.status :
+      const parserOversized = (error as { type?: string })?.type === "entity.too.large";
+      const status = error instanceof NativeError ? error.status : parserOversized ? 413 :
         error instanceof SyntaxError ? 400 : 503;
-      res.status(status).json({ error: error instanceof NativeError ? error.message : status === 400 ? "Invalid JSON" : "Storage unavailable" });
+      res.status(status).json({ error: error instanceof NativeError ? error.message : parserOversized
+        ? "HTTP JSON body exceeds 2 MiB parser limit; message text size and recipient are unavailable"
+        : status === 400 ? "Invalid JSON" : "Storage unavailable",
+        ...(error instanceof NativeError ? error.details : {}) });
     });
   }
 

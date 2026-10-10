@@ -134,7 +134,7 @@ export const SEND_MESSAGE_SCHEMA = {
   type: "object",
   properties: {
     to: { type: "string", minLength: 1, description: "Exact target agentId from list_agents" },
-    text: { type: "string", minLength: 1, maxLength: 262144, description: "Maximum 256 KiB of UTF-8 text (validated in bytes)." },
+    text: { type: "string", minLength: 1, description: "Maximum 256 KiB of UTF-8 text (validated in bytes)." },
     conversation_id: { type: "string", minLength: 1 },
     in_reply_to: { type: "string", minLength: 1 },
     delivery: { type: "string", enum: ["auto", "steer", "queue"] },
@@ -191,7 +191,6 @@ export default function nabPiExtension(pi: ExtensionAPI) {
     name: "send_message", label: "Send message", description: "Send text to an exact native NAB agent ID.", parameters: SEND_MESSAGE_SCHEMA,
     async execute(_id, params) {
       if (!agentId) throw new Error("NAB session binding is not initialized");
-      if (Buffer.byteLength(params.text, "utf8") > 256 * 1024) throw new Error("Text exceeds 256 KiB");
 
       // Listing and sending have to agree: an agent that cannot see a peer
       // must not reach it by quoting an agentId it learned elsewhere.
@@ -204,9 +203,10 @@ export default function nabPiExtension(pi: ExtensionAPI) {
         }
       }
 
+      const operationId = randomUUID();
       const send = () => sendMessage(baseUrl(), agentId, {
         to: params.to, text: params.text, conversation_id: params.conversation_id, in_reply_to: params.in_reply_to,
-        delivery: params.delivery || "auto", expects_reply: params.expects_reply ?? false, expires_in_seconds: 600, idempotency_key: randomUUID(),
+        delivery: params.delivery || "auto", expects_reply: params.expects_reply ?? false, expires_in_seconds: 600, idempotency_key: operationId,
       });
 
       let result: Awaited<ReturnType<typeof sendMessage>>;
@@ -217,7 +217,7 @@ export default function nabPiExtension(pi: ExtensionAPI) {
         // start it and deliver. Waking is silent by design, so sending looks
         // the same whether the recipient was up or not.
         const entry = registry?.get(params.to);
-        if (!entry) throw error;
+        if (!entry || !(error instanceof Error) || !error.message.startsWith("Broker 409: Recipient offline;")) throw error;
         await wakeAgent(entry.name);
         result = await send();
       }
