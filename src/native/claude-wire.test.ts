@@ -33,3 +33,12 @@ describe("native wire framing", () => {
     expect(() => new LineDecoder(() => {}).push(Buffer.from('not JSON\n'))).toThrow();
   });
 });
+
+
+it("decodes maximum UTF-8 text even when JSON escaping expands the frame", () => {
+  const text = "\u0001".repeat(256 * 1024);
+  const frame = userFrame("uds:/safe.sock", "peer", text);
+  const seen: WireFrame[] = [];
+  new LineDecoder((f) => seen.push(f)).push(Buffer.from(JSON.stringify(frame) + "\n"));
+  expect(parseEnvelope(seen[0].message!.content).text).toBe(text);
+});

@@ -47,7 +47,7 @@ export class HostLink {
   private connect() {
     if (this.stopped) return;
     const url = new URL("/ws", this.brokerUrl); url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(url, { maxPayload: 1024 * 1024 }); this.ws = ws;
+    const ws = new WebSocket(url, { maxPayload: 2 * 1024 * 1024 }); this.ws = ws;
     ws.on("open", () => {
       this.backoff = 500; this.register(); this.onConnection(true);
       this.heartbeat = setInterval(() => this.send({ type: "native.heartbeat", hostId: this.hostId, adapterId: this.adapterId }), 10000);

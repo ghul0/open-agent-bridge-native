@@ -88,6 +88,18 @@ describe("native registry transport fixtures", () => {
     expect((await send("unregistered", b.agentId)).status).toBe(400);
   });
 
+  it("transports exactly 256 KiB with escaped JSON and rejects one extra UTF-8 byte", async () => {
+    const a = endpoint("byte-host-a", "sender");
+    const b = endpoint("byte-host-b", "receiver");
+    await connect(a.hostId, [a]);
+    const receiver = await connect(b.hostId, [b]);
+    const text = "\u0001".repeat(256 * 1024);
+    expect((await send(a.agentId, b.agentId, { text })).status).toBe(201);
+    await expect.poll(() => receiver.deliveries().length).toBe(1);
+    expect(receiver.deliveries()[0].message.text).toBe(text);
+    expect((await send(a.agentId, b.agentId, { text: "ż".repeat(128 * 1024) + "x" })).status).toBe(400);
+  });
+
   it("supports independent adapters and sessions on one host without cwd dedup or snapshot theft", async () => {
     const a = endpoint("one-host", "one");
     const b = endpoint("one-host", "two");
@@ -407,7 +419,7 @@ describe("native ChannelStore durable queue", () => {
   });
 
   it("validates UTF-8 byte size and TTL, and persists correlated response as a separate message", () => {
-    expect(NativeSendSchema.safeParse({ to: "b", text: "ą".repeat(32769) }).success).toBe(false);
+    expect(NativeSendSchema.safeParse({ to: "b", text: "ą".repeat(131073) }).success).toBe(false);
     expect(NativeSendSchema.safeParse({ to: "b", text: "ok", expires_in_seconds: 86401 }).success).toBe(false);
     const a = endpoint("a", "sender");
     const b = endpoint("b", "receiver");

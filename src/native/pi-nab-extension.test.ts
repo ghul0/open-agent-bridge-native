@@ -2,8 +2,8 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { NativeEndpoint } from "./contracts.js";
-import { allowedNames, buildRoster, deliveryMode, readRegistry } from "./pi-nab-extension.js";
+import { NativeSendSchema, type NativeEndpoint } from "./contracts.js";
+import { allowedNames, buildRoster, deliveryMode, readRegistry, SEND_MESSAGE_SCHEMA } from "./pi-nab-extension.js";
 import { peerText } from "./host-link.js";
 import type { NativeMessage } from "./contracts.js";
 
@@ -213,5 +213,17 @@ describe("peerText", () => {
   it("still treats a different sender on the same host as a peer", () => {
     const text = peerText(message({ fromAgentId: "nab:host:pi:a", toAgentId: "nab:host:pi:b" }));
     expect(text).toContain("NAB peer message");
+  });
+});
+
+
+describe("UTF-8 message limits", () => {
+  it("accepts exactly 256 KiB and rejects an extra byte", () => {
+    const limit = 256 * 1024;
+    expect(SEND_MESSAGE_SCHEMA.properties.text.maxLength).toBe(limit);
+    for (const text of ["a".repeat(limit), "ż".repeat(limit / 2), "😀".repeat(limit / 4)]) {
+      expect(NativeSendSchema.parse({ to: SELF, text }).text).toBe(text);
+      expect(() => NativeSendSchema.parse({ to: SELF, text: text + "x" })).toThrow("256 KiB");
+    }
   });
 });

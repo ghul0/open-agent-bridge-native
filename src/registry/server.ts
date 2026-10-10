@@ -262,7 +262,7 @@ export class RegistryServer {
   }
 
   private setupRoutes(): void {
-    this.app.use(express.json({ limit: "512kb" }));
+    this.app.use(express.json({ limit: "2mb" }));
     if (this.options.native) {
       this.setupNativeRoutes();
       return;
@@ -693,7 +693,7 @@ export class RegistryServer {
     this.httpServer = createServer(this.app);
 
     // WebSocket server on /ws path
-    const wss = new WebSocketServer({ server: this.httpServer, path: "/ws", maxPayload: 1024 * 1024 });
+    const wss = new WebSocketServer({ server: this.httpServer, path: "/ws", maxPayload: 2 * 1024 * 1024 });
     this.wss = wss;
 
     // WebSocket keepalive: ping every 15s, terminate if no pong within 15s.

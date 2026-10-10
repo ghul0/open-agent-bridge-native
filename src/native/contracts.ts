@@ -29,7 +29,7 @@ export function nativeAgentId(hostId: string, harness: NativeEndpoint["harness"]
 
 export const NativeSendSchema = z.object({
   to: identifier,
-  text: z.string().min(1).refine((text) => Buffer.byteLength(text, "utf8") <= 64 * 1024, "Text exceeds 64 KiB"),
+  text: z.string().min(1).refine((text) => Buffer.byteLength(text, "utf8") <= 256 * 1024, "Text exceeds 256 KiB"),
   conversation_id: identifier.optional(),
   in_reply_to: identifier.optional(),
   delivery: z.enum(["auto", "steer", "queue"]).default("auto"),

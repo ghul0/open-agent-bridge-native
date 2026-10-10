@@ -100,7 +100,7 @@ export function sendFrame(address: string, frame: WireFrame): Promise<void> {
 }
 export class LineDecoder {
   private pending = Buffer.alloc(0);
-  constructor(private readonly onFrame: (f: WireFrame) => void, private readonly maxBytes = 128 * 1024) {}
+  constructor(private readonly onFrame: (f: WireFrame) => void, private readonly maxBytes = 2 * 1024 * 1024) {}
   push(chunk: Buffer) {
     this.pending = Buffer.concat([this.pending, chunk]);
     while (this.pending.indexOf(10) >= 0) {

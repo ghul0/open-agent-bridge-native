@@ -134,7 +134,7 @@ export const SEND_MESSAGE_SCHEMA = {
   type: "object",
   properties: {
     to: { type: "string", minLength: 1, description: "Exact target agentId from list_agents" },
-    text: { type: "string", minLength: 1, maxLength: 65536 },
+    text: { type: "string", minLength: 1, maxLength: 262144, description: "Maximum 256 KiB of UTF-8 text (validated in bytes)." },
     conversation_id: { type: "string", minLength: 1 },
     in_reply_to: { type: "string", minLength: 1 },
     delivery: { type: "string", enum: ["auto", "steer", "queue"] },
@@ -191,6 +191,7 @@ export default function nabPiExtension(pi: ExtensionAPI) {
     name: "send_message", label: "Send message", description: "Send text to an exact native NAB agent ID.", parameters: SEND_MESSAGE_SCHEMA,
     async execute(_id, params) {
       if (!agentId) throw new Error("NAB session binding is not initialized");
+      if (Buffer.byteLength(params.text, "utf8") > 256 * 1024) throw new Error("Text exceeds 256 KiB");
 
       // Listing and sending have to agree: an agent that cannot see a peer
       // must not reach it by quoting an agentId it learned elsewhere.
